@@ -1,0 +1,116 @@
+# ---------------------------------------------------------------------------
+# trauma_ml — experiment grid specifications
+# The CLI `trauma-train` loops over the Cartesian product of these axes
+# and runs a full fit+eval for each combination.
+# ---------------------------------------------------------------------------
+
+# Target definition. Each target has a `kind` (binary | ordinal_bands | survival)
+# and a specification dict consumed by src/trauma_ml/targets.py
+targets:
+  - name: in_hospital_mortality
+    kind: binary
+    spec:
+      positive_code: 5          # HOSPDISCHARGEDISPOSITION == 5 = deceased
+      include_ed_death: true    # also count EDDISCHARGEDISPOSITION == 5 as positive
+  - name: ISS_band
+    kind: ordinal_bands
+    spec:
+      variable: ISS             # harmonised with ISS_05 fallback for AY 2019
+      bands:                    # (lower_inclusive, upper_exclusive, label)
+        - [0,   9,  minor]
+        - [9,   16, moderate]
+        - [16,  25, severe]
+        - [25,  76, profound]
+  - name: NISS_band
+    kind: ordinal_bands
+    spec:
+      derive_from: AISSEVERITY  # sum of squares of the 3 highest AIS severities
+      bands:
+        - [0,   9,  minor]
+        - [9,   16, moderate]
+        - [16,  25, severe]
+        - [25,  76, profound]
+
+# Which registry's predictor set to use. `all` = no registry filter.
+predictor_types:
+  - all
+  - Tran NTDB
+  - Karolinska SweTrau
+  - RETRAUCI
+  - ECTrauma
+  - EIPD
+
+# Phase cutoff: the latest phase whose features are allowed as predictors.
+# "On-scene" is the most conservative (triage-time only);
+# "On-scene + ED arrival + In-hospital" is the most permissive.
+# In-hospital features are automatically excluded if they sit *after* the target event.
+phase_cutoffs:
+  - On-scene
+  - On-scene + ED arrival
+  - On-scene + ED arrival + In-hospital
+
+# Inclusion strategies are implemented in src/trauma_ml/inclusion.py.
+inclusion_strategies:
+  - Tran NTDB
+  - ECTrauma
+  - Karolinska SweTrau     # best-effort
+  - RETRAUCI               # best-effort (ICU-admission proxy)
+
+# Imputation strategies (implemented in src/trauma_ml/imputation.py)
+imputers:
+  - none              # passthrough (only works for models that handle NaN natively)
+  - median_mode       # SimpleImputer(median) for numeric, mode for categorical
+  - knn               # KNNImputer
+  - mice              # IterativeImputer
+  - missforest        # miceforest (optional dep)
+
+# Percentage of missing after which a predictor is dropped (from legacy main.py)
+missingness_thresholds: [30, 50, 75, 90]
+
+# Data augmentation (used only for binary mortality with class imbalance)
+data_augmentation:
+  - null
+  - smote
+  - adasyn
+
+# Calibration methods — each is a separate run (tagged via config.calibration)
+calibrations:
+  - none
+  - platt
+  - isotonic
+
+# Model families.  Each resolves to a concrete trainer in src/trauma_ml/models.py
+# Note: tabpfn, tabnet, catboost, ft_transformer and the survival families are
+# installable separately and therefore NOT in the default grid.  Add them back
+# by overriding --model-families from the CLI once you have the extras installed.
+model_families:
+  - logistic_l1
+  - logistic_elasticnet
+  - random_forest
+  - xgboost
+  - lightgbm
+  - flaml              # AutoML (wraps multiple underlying estimators)
+
+# Stratified split fractions. Stratified by (gender, age_group, target).
+split:
+  train_frac: 0.70
+  calibration_frac: 0.15
+  test_frac: 0.15
+  random_state: 42
+  age_bins:                 # ECTrauma-aligned bands, also used for subgroup metrics
+    edges: [0, 18, 45, 65, 75, 200]
+    labels: ["pediatric", "young_adult", "middle_aged", "early_elderly", "elderly"]
+
+# Subgroup evaluation axes (test-set metrics are broken down along each of these)
+subgroup_axes:
+  - gender
+  - age_group
+  - ethnicity
+  - race
+  - mechanism            # blunt / penetrating / burn / other (derived from TRAUMATYPE)
+  - intent               # unintentional / assault / self-harm / …
+
+# How much of the test set to mask for imputer evaluation (per variable, per method)
+imputation_eval:
+  mask_fraction: 0.10
+  random_state: 42

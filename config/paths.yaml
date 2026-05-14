@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# trauma_ml — central paths configuration
+# All relative paths are resolved against the repository root.
+# You can override any of these at runtime with --config or env vars.
+# ---------------------------------------------------------------------------
+
+# NTDB variable catalogue (xlsx). Sheet 6 is the authoritative variable list.
+variable_catalogue: "NTDB_variable_mapping_for_trauma_ML.xlsx"
+catalogue_sheet_name: "6. NTDB variable catalogue"
+catalogue_header_row: 4            # 1-indexed row with column headers
+
+# Root of the NTDB PUF data. One subfolder per admission year, each with /CSV inside.
+ntdb_root: "data/NTDB"
+ntdb_year_subdirs:
+  2019: "PUF AY 2019/CSV"
+  2020: "PUF AY 2020/CSV"
+  2021: "PUF AY 2021/CSV"
+  2022: "PUF AY 2022/CSV"
+  2024: "PUF AY 2024/CSV"
+
+# PUF table -> CSV filename pattern inside each year's /CSV folder.
+# NTDB ships one CSV per table; names are typically "PUF_TRAUMA.csv" etc.
+# If your downloads use a different convention, override the pattern here.
+ntdb_tables:
+  trauma:         "PUF_TRAUMA.csv"
+  aisdiagnosis:   "PUF_AISDIAGNOSIS.csv"
+  ais_lookup:     "PUF_AISDIAGNOSIS_LOOKUP.csv"
+  icddiagnosis:   "PUF_ICDDIAGNOSIS.csv"
+  icdprocedure:   "PUF_ICDPROCEDURE.csv"
+  ecode_lookup:   "PUF_ECODE_LOOKUP.csv"
+  hospitalevents: "PUF_HOSPITALEVENTS.csv"
+  tqp_inclusion:  "TQP_INCLUSION.csv"
+
+# Where the unified dataset parquet and splits are saved.
+outputs_root: "outputs"
+datasets_dir: "outputs/datasets"
+models_dir:   "outputs/models"
+metrics_dir:  "outputs/metrics"
+imputation_eval_dir: "outputs/imputation_eval"
+plots_dir:    "outputs/plots"
+
+# Record identifier in PUF_TRAUMA; dropped when anonymize=True
+record_id_column: "INC_KEY"

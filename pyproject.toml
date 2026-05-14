@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trauma_ml"
+version = "0.2.0"
+description = "AITrauma — ML pipeline for trauma mortality prediction"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+    "pyarrow>=14",
+    "matplotlib>=3.7",
+    "shap>=0.44",
+    "pyyaml",
+    "openpyxl",
+]
+
+[project.optional-dependencies]
+boosting = ["xgboost>=2.0", "lightgbm>=4.0", "catboost>=1.2"]
+automl   = ["flaml>=2.1"]
+full     = ["tabpfn>=2.0", "pytorch-tabnet>=4.0", "torch>=2.0"]
+survival = ["scikit-survival>=0.22"]
+imbalance= ["imbalanced-learn>=0.12"]
+serve    = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "pydantic>=2.0", "joblib>=1.3"]
+all      = ["trauma_ml[boosting,automl,full,survival,imbalance,serve]"]
+
+[project.scripts]
+trauma-build     = "trauma_ml.cli.build_dataset:main"
+trauma-train     = "trauma_ml.cli.run_experiments:main"
+trauma-predict   = "trauma_ml.cli.predict:main"
+trauma-aggregate = "trauma_ml.cli.aggregate_metrics:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["trauma_ml*"]

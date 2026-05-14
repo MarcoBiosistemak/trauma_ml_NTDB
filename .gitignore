@@ -1,0 +1,93 @@
+# ── Project-specific exclusions ───────────────────────────────────────────
+
+# NTDB raw data — never commit these (proprietary + huge + per-user)
+data/**
+# But preserve the directory STRUCTURE so people know where NTDB goes.
+# We re-include only .gitkeep markers and any documentation files.
+!data/
+!data/**/
+!data/**/.gitkeep
+!data/**/README.md
+
+# Model training outputs (parquets, plots, metrics, model bundles)
+outputs/
+# If you ever need to commit ONE specific result for a paper, do:
+#   git add -f outputs/path/to/that/file.csv
+# (-f overrides the ignore)
+
+# Project zip snapshots (we use git history instead of zip versioning)
+*.zip
+src_DIPC*.zip
+src.zip
+
+# Cluster log captures (local download of slurms/logs/)
+slurms/logs/
+
+# Cluster output downloads / scratch
+scratch/
+local_scratch/
+
+# Lab notebooks (often massive checkpoints + secrets)
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# ── Python / packaging ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# Profiling
+*.prof
+*.lprof
+
+# ── IDE / editor ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Secrets / local config ────────────────────────────────────────────────
+.env
+.env.local
+*.key
+*.pem
+config/secrets.yaml
+config/local.yaml
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak

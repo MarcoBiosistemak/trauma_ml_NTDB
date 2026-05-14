@@ -1,0 +1,57 @@
+# trauma_ml — full requirements (round 14, validated on DIPC atlas-edr)
+# Install with:
+#     pip install --prefer-binary -r slurms/requirements.txt
+#
+# This is the complete dependency list for the full pipeline (every model
+# family, every imputer, every calibration).  Tested on DIPC atlas-edr with
+# Python 3.10.4 (Lmod module Python/3.10.4-GCCcore-11.3.0) + CUDA 12.1.1.
+#
+# Why --prefer-binary matters: a few dependencies (libcst transitively via
+# pyarrow's build deps, scikit-survival cython extensions) require a Rust
+# or C compiler if pip falls back to source.  --prefer-binary forces pip
+# to take the latest prebuilt wheel.
+
+# ---- setuptools (must come BEFORE tpot/stopit) ----
+# stopit (a tpot transitive dep) imports `pkg_resources` which was removed
+# from setuptools 81+.  Pin to <81 so pkg_resources stays available.
+setuptools<81
+
+# ---- Core scientific stack ----
+# numpy<2.2 — pyarrow 19.x's manylinux wheels link against numpy 1.x ABI.
+numpy>=1.26,<2.2
+pandas>=2.0
+# pyarrow<20 — version 24.x has no cp310 manylinux wheel, forces source build,
+# which then needs Rust for libcst.  19.x has cp310 wheels and works cleanly.
+pyarrow>=15.0,<20.0
+scikit-learn>=1.4
+scipy>=1.11
+matplotlib>=3.7
+PyYAML>=6.0
+openpyxl>=3.1
+
+# ---- Tree-based gradient boosters ----
+xgboost>=2.0
+lightgbm>=4.0
+catboost>=1.2
+
+# ---- AutoML ----
+flaml[automl]>=2.0
+tpot>=1.0
+
+# ---- Deep tabular ----
+tabpfn>=2.0
+pytorch-tabnet>=4.1
+
+# ---- Survival families ----
+scikit-survival>=0.22
+
+# ---- Imputation, imbalance, explainability ----
+miceforest>=5.7
+imbalanced-learn>=0.12
+shap>=0.45
+
+# ---- Torch (install separately with --index-url for CUDA, see runbook) ----
+torch>=2.0
+
+# ---- Optional dev / test ----
+pytest>=7.4
