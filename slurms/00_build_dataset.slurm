@@ -30,5 +30,5 @@ python -c "import sys; print('Python:', sys.executable)"
 trauma-build \
     --anonymize \
     --verbose \
-    --years 2021 2022 2024 \
+    --years 2019 2020 2021 2022 2024 \
     --holdout-years 2024
