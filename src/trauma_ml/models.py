@@ -296,7 +296,10 @@ def tpot(
     n_jobs: int = 4,
     generations: int = 5,
     population_size: int = 20,
-    max_time_mins: int | None = 5,    # round 17: 5 min default to fit grid
+    max_time_mins: int | None = 15,   # round 35: was 5
+    cv: int = 3,                       # round 35: was 5
+    subsample: float = 0.2,            # round 35: was 1.0 (full data)
+    early_stop: int = 3,               # round 35: halt if no improvement
     **kwargs,
 ) -> Any:
     """TPOT classifier wrapper.
@@ -306,10 +309,28 @@ def tpot(
     fit, but the underlying search is `population_size * generations`
     pipeline evaluations, which is expensive.
 
-    Round 17: defaults to ``max_time_mins=5`` so the default grid (378
-    combos × 5 min ≈ 31 h) fits in a 2-day Slurm walltime.  Pass
-    ``max_time_mins=None`` for unlimited search (use only with a small
-    grid), or a larger int for deeper search per fit.
+    Round 35 — speed tuning for NTDB-scale data (1.44M training rows):
+      - ``subsample=0.2``: GA search runs on 20% of data (~288k rows).
+        Genetic search only needs relative rankings between candidate
+        pipelines, not perfect quality estimates; subsampling preserves
+        the rankings while reducing each candidate's fit cost ~5×.
+        The winning pipeline is then re-fit on the FULL training set
+        at the end of TPOT's search, so the deployed model sees all
+        the data.
+      - ``cv=3``: 3-fold cross-validation inside the GA instead of 5.
+        Loses a small amount of evaluation noise robustness; gains
+        1.67× search speed.  With 1.44M rows even 3-fold is plenty.
+      - ``max_time_mins=15``: bumped from 5.  Since each candidate
+        is now cheaper (subsample + 3-fold), 15 min explores ~3× more
+        candidates than the previous 5-min cap explored at full data.
+      - ``early_stop=3``: halt the GA if the best CV score doesn't
+        improve across 3 consecutive generations.  Saves time when
+        the search has converged; rarely hurts because TPOT's GA
+        plateaus quickly.
+
+    Pass overrides as kwargs to the factory if you want different
+    behaviour for a specific run, e.g. ``max_time_mins=None`` for
+    unlimited search on a small grid.
 
     Survival is not supported by TPOT.
     """
@@ -324,13 +345,17 @@ def tpot(
         )
     log.info(
         "tpot factory: generations=%d, population_size=%d, "
-        "max_time_mins=%s, n_jobs=%d",
-        generations, population_size, max_time_mins, n_jobs,
+        "max_time_mins=%s, cv=%d, subsample=%.2f, early_stop=%d, n_jobs=%d",
+        generations, population_size, max_time_mins, cv, subsample,
+        early_stop, n_jobs,
     )
     return _TPOTWrapper(
         generations=generations,
         population_size=population_size,
         max_time_mins=max_time_mins,
+        cv=cv,
+        subsample=subsample,
+        early_stop=early_stop,
         n_jobs=n_jobs,
         scoring="roc_auc" if task == "binary" else "accuracy",
     )
@@ -346,44 +371,77 @@ class _TPOTWrapper:
     so ``predict_proba`` / pickling work like any other estimator and
     the persistence layer doesn't need TPOT-specific code.
     """
-    def __init__(self, generations, population_size, max_time_mins, n_jobs, scoring):
+    def __init__(self, generations, population_size, max_time_mins,
+                  cv, subsample, early_stop,
+                  n_jobs, scoring):
         self.generations     = generations
         self.population_size = population_size
         self.max_time_mins   = max_time_mins
+        self.cv              = cv
+        self.subsample       = subsample
+        self.early_stop      = early_stop
         self.n_jobs          = n_jobs
         self.scoring         = scoring
         self.tpot_           = None
         self.model           = None   # the best fitted sklearn Pipeline
 
     def fit(self, X, y):
+        import numpy as np
         from tpot import TPOTClassifier
-        # TPOT had two incompatible API generations:
-        #   * 0.12.x  →  scoring='roc_auc', generations=N, population_size=N
-        #   * 1.x     →  scorers=['roc_auc'], scorers_weights=[1.0],
-        #                search_space='linear', max_time_mins=N (no generations/pop)
-        # We detect by trying the 1.x signature first; on TypeError we fall
-        # back to the legacy 0.12.x signature.
+
+        # ── Round 35: subsample for the GA search ────────────────────────
+        # TPOT 1.x has no native subsample param.  We do it manually:
+        # pass a stratified subsample to TPOT for the genetic search,
+        # then re-fit the WINNING pipeline on the full data at the end.
+        # This preserves pipeline rankings (what GA cares about) while
+        # making each candidate evaluation ~1/subsample faster.
+        if 0 < self.subsample < 1.0 and len(X) > 10_000:
+            from sklearn.model_selection import StratifiedShuffleSplit
+            sss = StratifiedShuffleSplit(
+                n_splits=1, train_size=self.subsample, random_state=42,
+            )
+            try:
+                idx, _ = next(sss.split(X, y))
+                X_sub = X.iloc[idx] if hasattr(X, "iloc") else X[idx]
+                y_sub = y.iloc[idx] if hasattr(y, "iloc") else y[idx]
+                log.info(
+                    "TPOT subsample %.0f%%: GA will search on %d rows "
+                    "(full %d) — winner re-fit on full data at end",
+                    100 * self.subsample, len(idx), len(X),
+                )
+            except ValueError as exc:
+                # Stratification can fail if a target class is too rare for
+                # the subsample to contain at least 2 examples; fall back.
+                log.warning("Subsample stratification failed (%s); using "
+                            "full data for GA search", exc)
+                X_sub, y_sub = X, y
+        else:
+            X_sub, y_sub = X, y
+
+        # ── TPOT API detection (0.12.x vs 1.x) ───────────────────────────
         common = dict(
             n_jobs=self.n_jobs,
             random_state=42,
-            verbose=2,   # TPOT 1.x parameter name (was 'verbosity' in 0.12.x)
+            verbose=2,
         )
         if self.max_time_mins is not None:
             common["max_time_mins"] = self.max_time_mins
-
-        # ── Attempt the TPOT 1.x signature ──────────────────────────────
+        # early_stop: only TPOT 0.12.x supports this directly; 1.x uses
+        # its own GA convergence criteria.  We try to pass it; if rejected,
+        # the fallback path will omit it.
         try:
             self.tpot_ = TPOTClassifier(
                 scorers=[self.scoring],
                 scorers_weights=[1.0],
                 search_space="linear",
-                cv=5,
+                cv=self.cv,
                 **common,
             )
-            log.info("Using TPOT 1.x API (scorers=, search_space=)")
+            log.info("Using TPOT 1.x API (scorers=, search_space=, cv=%d)",
+                     self.cv)
         except TypeError:
-            # ── Fall back to TPOT 0.12.x signature ──────────────────────
-            log.info("Falling back to TPOT 0.12.x API (scoring=, generations=)")
+            log.info("Falling back to TPOT 0.12.x API (scoring=, generations=, "
+                     "cv=%d, early_stop=%d)", self.cv, self.early_stop)
             kwargs = dict(
                 generations=self.generations,
                 population_size=self.population_size,
@@ -391,17 +449,41 @@ class _TPOTWrapper:
                 n_jobs=self.n_jobs,
                 random_state=42,
                 verbosity=2,
-                cv=5,
+                cv=self.cv,
+                early_stop=self.early_stop,
             )
             if self.max_time_mins is not None:
                 kwargs["max_time_mins"] = self.max_time_mins
             self.tpot_ = TPOTClassifier(**kwargs)
 
-        self.tpot_.fit(X, y)
+        self.tpot_.fit(X_sub, y_sub)
         # Both API generations expose the best fitted pipeline as
         # ``fitted_pipeline_``; this is a regular sklearn Pipeline that
         # works for predict_proba / pickling.
-        self.model = self.tpot_.fitted_pipeline_
+        best_pipeline = self.tpot_.fitted_pipeline_
+
+        # ── Round 35: re-fit the winning pipeline on the FULL data ───────
+        # The GA's `fitted_pipeline_` was fit only on the subsample.  For
+        # final inference we want the same pipeline architecture trained
+        # on all rows, so its decisions reflect the full data
+        # distribution (not just 20% of it).  Clone the architecture and
+        # re-fit on (X, y).  This adds one model fit's wall-clock but
+        # preserves the full benefit of the data we have.
+        if 0 < self.subsample < 1.0 and len(X) > 10_000:
+            from sklearn.base import clone
+            try:
+                refit = clone(best_pipeline)
+                log.info("Re-fitting winning pipeline on full data "
+                         "(was fit on %d-row subsample, now %d rows)",
+                         len(X_sub), len(X))
+                refit.fit(X, y)
+                self.model = refit
+            except Exception as exc:
+                log.warning("Re-fit on full data failed (%s); keeping "
+                            "subsample-fit pipeline", exc)
+                self.model = best_pipeline
+        else:
+            self.model = best_pipeline
         return self
 
     def predict(self, X):

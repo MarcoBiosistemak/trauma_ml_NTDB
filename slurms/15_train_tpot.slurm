@@ -7,20 +7,18 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=20
-#SBATCH --mem=300G
+#SBATCH --mem=200G
 #SBATCH --time=8-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
-# Round 33: TPOT's Dask scheduler was OOM-killed mid-grid on the
-# 120 GB / 2-day allocation ("Event loop was unresponsive in Nanny
-# for 114s" → SLURM kill).  Memory raised 120 → 300 GB (uses the
-# fatter nodes via the regular partition), walltime extended to
-# 8 days.  Full preprocessing grid (4 cutoffs × 2 imputers × 3 cals
-# × 3 augs × 2 missingness = 144 combos) kept intact so TPOT
-# competes against all other families on equal preprocessing
-# footing.  Per-combo time is dominated by TPOT's internal AutoML
-# search; expect ~30-60 min per combo at this scale.
+# Round 35: TPOT factory now subsamples training to 20% for the GA search
+# and re-fits the winner on full data (see models.py::tpot).  Combined
+# with cv=3 (was 5) and early_stop=3, per-combo wall-clock should drop
+# from ~30-60 min to ~5-10 min.  Memory pressure also reduced because
+# Dask scheduler holds less data per worker — dropped 300G → 200G.
+# Walltime kept at xlong (8d) as safety margin; expected actual
+# walltime for full 144-combo grid is now 12-24 h rather than 3-5 days.
 
 # trauma-train on the TPOT family.
 # Model IDs prefixed tpt_*.  Each job writes to non-overlapping

@@ -27,6 +27,70 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Case-variant column deduplication (round 35)
+# ---------------------------------------------------------------------------
+def _dedupe_case_variants(df: pd.DataFrame, *, context: str = "") -> pd.DataFrame:
+    """Merge columns sharing a name modulo case, coalescing their values.
+
+    NTDB CSVs across years ship the same logical column under different
+    casings: e.g. AY 2019 has ``AgeYears``, AY 2021 has ``AGEYEARS``, AY
+    2022 has ``AGEyears``.  After per-year alias resolution and the
+    pd.concat across years, the unified frame ends up with all three as
+    SEPARATE columns, each filled only for the years that originally
+    used that casing.  Downstream predictor selection treats them as
+    distinct, picks one (the dict-order winner), finds it mostly-NaN
+    (because it only covers a subset of years), and drops it for
+    exceeding the missingness threshold — so the column effectively
+    vanishes from the model.
+
+    This helper does the right thing in one pass:
+      1. Group columns by their lowercase name.
+      2. For each group with >1 member, coalesce values row-by-row
+         (first non-null wins).
+      3. Promote the all-upper-case variant as canonical (or the first
+         variant if none is upper).  Drop the others.
+
+    Idempotent — safe to call on already-clean frames.
+
+    Round 35 places this at THREE points:
+      - end of ``load_year`` (so per-year frames are clean post-alias)
+      - after ``pd.concat`` in ``build_unified_dataset`` (catches
+        cross-year collisions)
+      - in the trainer (round 34) for already-built parquets
+    """
+    seen_lower: dict[str, str] = {}
+    groups: dict[str, list[str]] = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl in seen_lower:
+            groups.setdefault(cl, [seen_lower[cl]]).append(c)
+        else:
+            seen_lower[cl] = c
+
+    if not groups:
+        return df
+
+    for cl, variants in groups.items():
+        before = {v: int(df[v].notna().sum()) for v in variants}
+        coalesced = df[variants[0]]
+        for v in variants[1:]:
+            coalesced = coalesced.fillna(df[v])
+        canonical_name = next((v for v in variants if v.isupper()), variants[0])
+        df[canonical_name] = coalesced
+        for v in variants:
+            if v != canonical_name and v in df.columns:
+                df = df.drop(columns=[v])
+        log.info(
+            "%s_dedupe_case_variants: %s -> %s (was %s; now %d non-null)",
+            f"[{context}] " if context else "",
+            variants, canonical_name,
+            ", ".join(f"{k}={v}" for k, v in before.items()),
+            int(df[canonical_name].notna().sum()),
+        )
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Year-to-year harmonisation (see sheet 4 of the xlsx)
 # ---------------------------------------------------------------------------
 def harmonise_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -108,7 +172,46 @@ def harmonise_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
                      "INITIALRR", "RESP_RATE"),
     }
     # Build lowercase -> actual column name index (handles AGEyears, etc.)
-    col_lower_to_actual = {c.lower(): c for c in out.columns}
+    # Round 34: when MULTIPLE columns collapse to the same lowercase key
+    # (e.g. NTDB ships AGEYEARS, AGEyears, AgeYears in the same year's CSV),
+    # we must consolidate them into ONE canonical column.  The naive dict
+    # comprehension overwrites silently and the trainer's predictor-selector
+    # later misses the column entirely.  We coalesce by picking the variant
+    # with the most non-null cells per row (i.e. .bfill across the variant
+    # group), then drop the duplicates.
+    col_lower_to_actual: dict[str, str] = {}
+    duplicate_groups: dict[str, list[str]] = {}
+    for c in out.columns:
+        cl = c.lower()
+        if cl in col_lower_to_actual:
+            duplicate_groups.setdefault(cl, [col_lower_to_actual[cl]]).append(c)
+        else:
+            col_lower_to_actual[cl] = c
+
+    # Consolidate duplicate-cased columns
+    for cl, variants in duplicate_groups.items():
+        # Coalesce: take first non-null value across variants per row
+        coalesced = out[variants[0]]
+        for v in variants[1:]:
+            coalesced = coalesced.fillna(out[v])
+        # Prefer the all-upper-case variant as the canonical, else the
+        # first variant we encountered
+        canonical_name = next((v for v in variants if v.isupper()), variants[0])
+        out[canonical_name] = coalesced
+        # Drop the others
+        for v in variants:
+            if v != canonical_name and v in out.columns:
+                out = out.drop(columns=[v])
+        log.info(
+            "AY %d: coalesced duplicate-cased columns %s -> %s "
+            "(%d non-null after merge, was %s)",
+            year, variants, canonical_name,
+            int(out[canonical_name].notna().sum()),
+            ", ".join(f"{v}={int(out[v].notna().sum())}" for v in variants
+                       if v in out.columns or v == canonical_name),
+        )
+        # Re-index col_lower_to_actual
+        col_lower_to_actual[cl] = canonical_name
 
     for canonical, aliases in canonical_aliases.items():
         if canonical in out.columns:
@@ -118,9 +221,13 @@ def harmonise_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
             actual = col_lower_to_actual[canonical.lower()]
             if actual != canonical:
                 out[canonical] = out[actual]
+                # Round 35: drop the source column to prevent it persisting
+                # into the unified parquet as a duplicate of `canonical`.
+                if actual in out.columns:
+                    out = out.drop(columns=[actual])
                 log.info(
-                    "AY %d: aliased %s -> %s (case-insensitive match for "
-                    "canonical name)",
+                    "AY %d: aliased %s -> %s and dropped source "
+                    "(case-insensitive match for canonical name)",
                     year, actual, canonical,
                 )
             continue
@@ -129,9 +236,12 @@ def harmonise_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
             if alias.lower() in col_lower_to_actual:
                 actual = col_lower_to_actual[alias.lower()]
                 out[canonical] = out[actual]
+                # Round 35: drop source after aliasing
+                if actual in out.columns and actual != canonical:
+                    out = out.drop(columns=[actual])
                 log.info(
-                    "AY %d: renamed %s -> %s (canonical name expected by "
-                    "catalogue / baselines)",
+                    "AY %d: renamed %s -> %s and dropped source "
+                    "(canonical name expected by catalogue / baselines)",
                     year, actual, canonical,
                 )
                 break
@@ -145,6 +255,11 @@ def harmonise_year(df: pd.DataFrame, year: int) -> pd.DataFrame:
             year, list(canonical_aliases["AGEYEARS"]),
             sorted([c for c in out.columns if c.upper().startswith("A")])[:10],
         )
+
+    # Round 35: belt-and-braces — clean up any remaining case-variant
+    # duplicates that the alias resolver didn't catch (e.g. columns
+    # not in `canonical_aliases` that still ship under multiple casings).
+    out = _dedupe_case_variants(out, context=f"AY {year}")
 
     return out
 
@@ -608,6 +723,13 @@ def build_unified_dataset(
     # Concatenate, letting pandas align columns (missing -> NaN)
     unified = pd.concat(frames, ignore_index=True, sort=False)
     log.info("Merged %d years into shape %s", len(frames), unified.shape)
+
+    # Round 35: cross-year case-variant cleanup.
+    # Even with per-year dedup in load_year, concat across years can
+    # produce duplicates if year A normalised AgeYears -> AGEYEARS while
+    # year B's CSV happens to have a third casing the alias resolver
+    # didn't anticipate.  Run a final dedup pass on the unified frame.
+    unified = _dedupe_case_variants(unified, context="unified")
 
     # Apply whitelist
     unified = apply_whitelist(

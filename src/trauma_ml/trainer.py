@@ -165,6 +165,14 @@ class Trainer:
         self.data = pd.read_parquet(self.cfg.dataset_path)
         log.info("Loaded %d rows × %d cols", *self.data.shape)
 
+        # Round 34: coalesce columns that share a name modulo case
+        # (e.g. AGEYEARS / AGEyears / AgeYears).  The build's alias resolver
+        # is supposed to do this at parquet-write time, but existing
+        # parquets built before this fix carry the duplicates.  Doing it
+        # here makes ALL training resilient to the old build artefact,
+        # avoiding a full rebuild.
+        self._coalesce_duplicate_cased_columns()
+
         if 0 < self.cfg.sample_fraction < 1.0:
             n_keep = int(len(self.data) * self.cfg.sample_fraction)
             self.data = self.data.sample(
@@ -226,6 +234,63 @@ class Trainer:
         self.data = self.data.loc[mask_valid].copy()
         if n_dropped:
             log.info("Dropped %d rows due to missing 'gender'", n_dropped)
+
+    def _coalesce_duplicate_cased_columns(self) -> None:
+        """Merge columns that share a name modulo case.
+
+        Round 34: NTDB parquets built before round-34's loader fix can
+        carry triplicated columns like ``AGEYEARS``, ``AGEyears``, and
+        ``AgeYears`` — because the per-year alias resolver only checked
+        whether the canonical name existed, missing other-cased duplicates.
+
+        When ``_select_predictors`` later builds a lowercase→actual lookup
+        for case-insensitive catalogue matching, only ONE of the variants
+        wins (whichever the dict comprehension processed last); the others
+        are invisible.  If that winner is the variant with high NaN rate,
+        ``_drop_high_missingness`` then deletes it and the column appears
+        nowhere in the model.
+
+        Fix: detect duplicate-cased columns, coalesce their values per row
+        (first non-null wins), promote the all-upper-case variant as
+        canonical (or whichever variant we encountered first), drop the
+        rest.  Idempotent — safe to call on already-clean parquets.
+        """
+        seen_lower: dict[str, str] = {}
+        groups: dict[str, list[str]] = {}
+        for c in self.data.columns:
+            cl = c.lower()
+            if cl in seen_lower:
+                groups.setdefault(cl, [seen_lower[cl]]).append(c)
+            else:
+                seen_lower[cl] = c
+
+        if not groups:
+            return
+
+        for cl, variants in groups.items():
+            non_null_before = {v: int(self.data[v].notna().sum())
+                               for v in variants}
+            # Coalesce — first variant's non-null values win, fill from others
+            coalesced = self.data[variants[0]]
+            for v in variants[1:]:
+                coalesced = coalesced.fillna(self.data[v])
+
+            # Promote the all-upper-case canonical if any, else first variant
+            canonical_name = next((v for v in variants if v.isupper()),
+                                   variants[0])
+            self.data[canonical_name] = coalesced
+
+            for v in variants:
+                if v != canonical_name and v in self.data.columns:
+                    self.data = self.data.drop(columns=[v])
+
+            log.info(
+                "Coalesced duplicate-cased columns -> %s "
+                "(before: %s; after: %d non-null)",
+                canonical_name,
+                ", ".join(f"{k}={v}" for k, v in non_null_before.items()),
+                int(self.data[canonical_name].notna().sum()),
+            )
 
     def _build_target(self):
         y = build_target(self.data, self.cfg.target)
