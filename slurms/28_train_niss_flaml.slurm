@@ -1,39 +1,38 @@
 #!/bin/bash
-#SBATCH --job-name=trauma_niss_lgb
-#SBATCH --output=slurms/logs/train_niss_lgb_%j.out
-#SBATCH --error=slurms/logs/train_niss_lgb_%j.err
+#SBATCH --job-name=trauma_niss_flm
+#SBATCH --output=slurms/logs/train_niss_flm_%j.out
+#SBATCH --error=slurms/logs/train_niss_flm_%j.err
 #SBATCH --partition=general
-#SBATCH --qos=regular
+#SBATCH --qos=long
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:rtx3090:1
-#SBATCH --mem=80G
-#SBATCH --time=1-00:00:00
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=120G
+#SBATCH --time=2-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
-# trauma-train on the NISS_LGB family for the NISS_BAND target.
-# Multiclass classification — predicting ISS/NISS bands rather than mortality.
-# Outputs land under outputs/niss_band/ (NOT outputs/) so they don't collide
-# with the mortality run's outputs/{models,metrics,plots}/.
+# trauma-train: FLAML AutoML on NISS_band (multiclass).
+# Round 36: added FLAML/TPOT to band targets for completeness vs mortality.
 #
-# Round 19: multiclass slurms.  Grid is narrower than the mortality slurms
-# because calibration (Platt/isotonic) and augmentation (SMOTE/ADASYN) do
-# not generalise cleanly to multiclass.  Baseline scores (ISS/NISS/TRISS)
-# are NOT computed by the aggregator for non-mortality targets — there's
-# nothing to compare against since the bands ARE derived from those scores.
+# FLAML's AutoML supports task='multiclass' natively.  Each combo runs
+# FLAML's internal time-budgeted search (default 300s = 5 min) which
+# usually picks LightGBM or CatBoost as the winner.  Total per-combo
+# wall-clock ≈ 5-10 min including preprocessing.
+#
+# Note FLAML does NOT save a SHAP plot through the standard pipeline —
+# its sklearn-compat wrapper hides the underlying winning estimator from
+# SHAP's TreeExplainer.  See round-36 notes for inspecting FLAML
+# feature importances via artifact.pkl after the fact.
 
 set -euo pipefail
 mkdir -p slurms/logs
 
 module purge
 module load Python/3.10.4-GCCcore-11.3.0
-module load CUDA/12.1.1
 source "/scratch/${USER}/trauma_ml_venv/bin/activate"
 
 echo "[INFO] Slurm job ${SLURM_JOB_ID} on $(hostname)"
-nvidia-smi || echo "[WARN] nvidia-smi not available"
 
 trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
@@ -43,20 +42,20 @@ trauma-train \
     --predictor-types "Tran NTDB" \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" \
     --imputers      median_mode mice \
-    --model-families lightgbm \
+    --model-families flaml \
     --calibrations  none \
     --augmentations null \
     --missingness-thresholds 25 50 85 \
-    --use-gpu       auto \
-    --model-id-prefix niss_lgb \
+    --use-gpu       never \
+    --model-id-prefix niss_flm \
     --no-aggregate \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose
 
 # ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
-# Appended so they never renumber the existing niss_lgb_* models above.
+# Appended so they never renumber the existing niss_flm_* models above.
 # (a) imputer_check=True — drop features the imputer can't reconstruct
-#     on the calibration set.  Prefix niss_lgb_ic.
+#     on the calibration set.  Prefix niss_flm_ic.
 trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
@@ -66,18 +65,18 @@ trauma-train \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" \
     --imputers      median_mode mice \
     --imputer-check \
-    --model-families lightgbm \
+    --model-families flaml \
     --calibrations  none \
     --augmentations null \
     --missingness-thresholds 25 50 85 \
-    --use-gpu       auto \
-    --model-id-prefix niss_lgb_ic \
+    --use-gpu       never \
+    --model-id-prefix niss_flm_ic \
     --no-aggregate \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose
 
-# (b) imputer=none — lightgbm handles NaN natively; no imputation.
-#     imputer_check irrelevant here.  Prefix niss_lgb_none.
+# (b) imputer=none — flaml handles NaN natively; no imputation.
+#     imputer_check irrelevant here.  Prefix niss_flm_none.
 trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
@@ -86,12 +85,12 @@ trauma-train \
     --predictor-types "Tran NTDB" \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" \
     --imputers      none \
-    --model-families lightgbm \
+    --model-families flaml \
     --calibrations  none \
     --augmentations null \
     --missingness-thresholds 25 50 85 \
-    --use-gpu       auto \
-    --model-id-prefix niss_lgb_none \
+    --use-gpu       never \
+    --model-id-prefix niss_flm_none \
     --no-aggregate \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose

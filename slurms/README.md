@@ -1,63 +1,137 @@
-# slurms/ — DIPC supercomputer pipeline (round 14, validated on atlas-edr)
+# slurms/ — DIPC supercomputer pipeline (round 37, validated on atlas-edr)
 
-For the step-by-step "what to run, in what order" guide, read **`DIPC_RUNBOOK.md`** at the project root. This file is the brief reference for what's in the directory.
+Brief reference for what's in this directory and how to run it. For the full
+project context see the top-level project docs.
+
+## Cluster + environment
+
+* Cluster: `atlas-edr.sw.ehu.es`, partition `general`. Two load-balanced login
+  nodes (`-01`, `-02`); environment does NOT persist between sessions, so every
+  interactive session must reload the module + venv:
+
+  ```bash
+  module purge && module load Python/3.10.4-GCCcore-11.3.0
+  source /scratch/$USER/trauma_ml_venv/bin/activate
+  cd /scratch/$USER/trauma_ml
+  ```
+
+  (Suggested `~/.bashrc` alias `trauma_env` does all four at once.)
+
+* QoS ceilings: `regular` = 1 day, `long` = 2 days, `xlong` = 8 days.
 
 ## Files
 
-| File | Family / Purpose | Compute | Prefix | Walltime |
+| File | Family / Purpose | Compute | Base prefix | qos / walltime |
 |---|---|---|---|---|
-| `requirements.txt` | Python deps with all pins learned from real installs | — | — | — |
-| `setup_env.slurm` | One-off venv build + pip install — alternative to interactive setup | CPU | — | 2 h |
-| `00_build_dataset.slurm` | One-off `trauma-build` (AY 2019/2020/2021/2022 train + 2024 holdout) | CPU | — | 6 h |
-| `10_train_logistic.slurm` | logistic_l1 + logistic_elasticnet | CPU | `lgr_*` | 1 day |
-| `11_train_lightgbm.slurm` | lightgbm | GPU (rtx3090) | `lgb_*` | 1 day |
-| `12_train_xgboost.slurm` | xgboost | GPU (rtx3090) | `xgb_*` | 1 day |
-| `13_train_catboost.slurm` | catboost | GPU (rtx3090) | `cb_*` | 1 day |
-| `14_train_flaml.slurm` | flaml (AutoML) | CPU | `flm_*` | 2 days |
-| `15_train_tpot.slurm` | tpot (AutoML) | CPU | `tpt_*` | 3 days |
-| `16_train_random_forest.slurm` | random_forest | CPU | `rf_*` | 2 days |
-| `17_train_tabpfn.slurm` | tabpfn (sub-sampled to ~12k) | GPU (rtx3090) | `tpf_*` | 6 h |
-| `18_train_tabnet.slurm` | tabnet | GPU (rtx3090) | `tnt_*` | 1 day |
-| `19_train_survival.slurm` | cox_ph + random_survival_forest | CPU | `surv_*` | 2 days |
-| `99_aggregate.slurm` | One-off aggregation after all training jobs return success | CPU | — | 2 h |
-| `submit_all.sh` | Wrapper that submits everything with the right dependency chain | — | — | — |
+| `setup_env.slurm` | One-off venv build + `pip install -e .` | CPU | — | regular / 2 h |
+| `00_build_dataset.slurm` | One-off `trauma-build` (AY 2019-2022 train + 2024 holdout) | CPU | — | regular / 6 h |
+| `10_train_logistic.slurm` | logistic_l1 + logistic_elasticnet | CPU | `lgr` | xlong / 8 d |
+| `11_train_lightgbm.slurm` | lightgbm | GPU auto | `lgb` | xlong / 4 d |
+| `12_train_xgboost.slurm` | xgboost | GPU auto | `xgb` | xlong / 4 d |
+| `13_train_catboost.slurm` | catboost | GPU auto | `cb` | xlong / 4 d |
+| `14_train_flaml.slurm` | flaml (AutoML) | CPU | `flm` | xlong / 4 d |
+| `15_train_tpot.slurm` | tpot (AutoML) | CPU | `tpt` | xlong / 8 d |
+| `16_train_random_forest.slurm` | random_forest | CPU | `rf` | xlong / 4 d |
+| `17_train_tabpfn.slurm` | tabpfn (sub-sampled) | GPU force | `tpf` | xlong / 4 d |
+| `18_train_tabnet.slurm` | tabnet | GPU force | `tnt` | xlong / 4 d |
+| `19_train_survival.slurm` | cox_ph + random_survival_forest (NOT currently used) | CPU | `surv` | long / 2 d |
+| `20_train_iss_xgboost.slurm` | xgboost on ISS_band | GPU auto | `iss_xgb` | xlong / 4 d |
+| `21_train_iss_lightgbm.slurm` | lightgbm on ISS_band | GPU auto | `iss_lgb` | xlong / 4 d |
+| `22_train_iss_random_forest.slurm` | random_forest on ISS_band | CPU | `iss_rf` | xlong / 4 d |
+| `23_train_niss_xgboost.slurm` | xgboost on NISS_band | GPU auto | `niss_xgb` | xlong / 4 d |
+| `24_train_niss_lightgbm.slurm` | lightgbm on NISS_band | GPU auto | `niss_lgb` | xlong / 4 d |
+| `25_train_niss_random_forest.slurm` | random_forest on NISS_band | CPU | `niss_rf` | xlong / 4 d |
+| `26_train_iss_flaml.slurm` | flaml on ISS_band | CPU | `iss_flm` | long / 2 d |
+| `27_train_iss_tpot.slurm` | tpot on ISS_band | CPU | `iss_tpt` | xlong / 8 d |
+| `28_train_niss_flaml.slurm` | flaml on NISS_band | CPU | `niss_flm` | long / 2 d |
+| `29_train_niss_tpot.slurm` | tpot on NISS_band | CPU | `niss_tpt` | xlong / 8 d |
+| `99_aggregate.slurm` | One-off aggregation after all training returns | CPU | — | regular / 4 h |
 
-## Resource sizing (validated against atlas-edr.sw.ehu.es, April 2026)
+## Round 37: imputer_check + imputer=none (multiple invocations per slurm)
 
-* GPU jobs request `--gres=gpu:rtx3090:1` (RTX 3090, 24 GB VRAM, 7 nodes, Ampere).
-* GPU jobs use `--mem=80G` (RTX 3090 nodes have 95 GB total / ~92 GB usable).
-* CPU jobs use up to `--mem=120G` (smallest CPU nodes have 128 GB / ~125 GB usable).
-* Largest CPU request is `--cpus-per-task=20` (smallest GPU/CPU node has 32-48 cores).
+Each family slurm now contains **stacked `trauma-train` invocations**, each with
+its OWN `--model-id-prefix` so they never renumber or collide with each other.
+The resume tracker keys on `<prefix>_<idx>`: a new prefix is a fresh sequence,
+and any model whose `overall__test.json` already exists is skipped instantly.
 
-If you adapt to a different cluster, run `sinfo -N -p <partition> -o "%n %c %m %G"` and adjust those three numbers in every slurm.
+| Invocation | Prefix suffix | What it does | Which families |
+|---|---|---|---|
+| base | (none, e.g. `xgb`) | impute (median_mode, mice), imputer_check=False — the original grid | all |
+| (a) | `_ic` (e.g. `xgb_ic`) | impute, then DROP features the imputer can't reconstruct on the calibration set | all |
+| (b) | `_none` (e.g. `xgb_none`) | no imputation; model consumes NaN directly | xgboost, lightgbm, catboost, flaml ONLY |
 
-## How parallelism + Pareto work
+**Why `_none` is restricted:** xgboost / lightgbm / catboost / flaml handle NaN
+natively (learned default split direction). logistic, random_forest, tpot,
+tabnet, tabpfn cannot consume NaN — so `imputer=none` produces zero combos for
+them and they get only the base + `_ic` invocations.
 
-Each training job:
+**imputer_check, briefly:** with `--imputer-check`, after fitting the imputer the
+trainer masks 10% of known values **on the calibration set** (the test set is
+left fully untouched), measures per-feature reconstruction (relative MAE for
+numeric, accuracy for categorical), and keeps only features that pass the
+thresholds (numeric MAE/std < 0.5, categorical accuracy > 0.7). The
+`imputation_eval_<method>.csv` records `keep` per feature. If NO feature
+survives, the run writes NaN metrics + a `skipped` flag and is marked done (so it
+isn't retried).
 
-1. Trains a disjoint subset of the experiment grid (different `--model-families`).
-2. Uses a distinct `--model-id-prefix` so per-model output paths never collide:
-   `outputs/models/lgr_NNNN/`, `outputs/models/lgb_NNNN/`, etc.
-3. Passes `--no-aggregate` so it skips writing its own `all_metrics.csv`. Otherwise three jobs would race to overwrite each other.
+**imputer=none collapses the check dimension:** when there's no imputation there's
+nothing to check, so `imputer=none` only ever produces the imputer_check=False
+variant — no duplicate runs.
 
-`99_aggregate.slurm` runs *once* after every training job has succeeded (`afterok` dependency), walks the entire `outputs/metrics/` tree, and produces:
+**Backward compatibility:** models trained before round 37 have no `imputer_check`
+field in their config.json. Treat a missing field as False. The standalone
+`patch_imputer_check.py` (project root, NOT in the package) backfills
+`imputer_check: false` into existing configs; it is idempotent and only needs to
+be run once.
 
-* `outputs/all_metrics.csv` — unified Pareto across every model from every job
-* `outputs/all_metrics__cohort_*.csv` — per-cohort variants
-* `outputs/baseline_metrics.csv` — long-format ISS/NISS/TRISS (with calibration variants)
-* `outputs/cohort_counts.csv` — case counts per cohort
+## Resource sizing (validated against atlas-edr.sw.ehu.es)
+
+* GPU jobs request a GPU via `--use-gpu auto` (lgb/xgb/cb) or `force` (tabpfn/
+  tabnet); the RTX 3090 has 24 GB VRAM.
+* random_forest uses `--mem=250G` + `--n-jobs 12` + `max_samples=0.5` in the
+  factory — round-36 fix for OOM-kills on the band targets at 2.75M rows × 500
+  trees.
+* tpot uses `--mem=200G`; its GA search runs on a 20% subsample (round 35) with
+  the winning pipeline re-fit on full data.
+
+## How parallelism + aggregation work
+
+Each training job trains a disjoint slice of the grid (distinct
+`--model-families` and prefix) and passes `--no-aggregate` so it never writes its
+own `all_metrics.csv` (otherwise concurrent jobs would race). `99_aggregate.slurm`
+runs once after all training succeeds, walks `outputs/<target>/metrics/`, and
+writes the unified `all_metrics.csv`, per-cohort variants, and
+`baseline_metrics.csv` (ISS / NISS / TRISS).
 
 ## Notes on specific families
 
-* **TabPFN (`17_train_tabpfn.slurm`)** is hard-capped at ~10,000 training rows by its pretrained transformer architecture. The slurm passes `--sample-fraction 0.005` for the full NTDB pool (4.67M rows). Bump that fraction only if you've already filtered the cohort heavily.
-* **Survival (`19_train_survival.slurm`)** uses `--targets survival_time` rather than `in_hospital_mortality`. Don't try to mix `cox_ph` or `random_survival_forest` into another slurm with a binary target — they error at trainer time.
-* **TPOT (`15_train_tpot.slurm`)** depends on `setuptools<81` because its transitive dep `stopit` imports the legacy `pkg_resources` API removed in setuptools 81+. The pin is in `requirements.txt`.
-* **`ft_transformer` and `deep_surv`** are intentionally absent — they're scaffolds in `models.py` that raise `NotImplementedError`.
+* **random_forest** runs with `--no-shap` on BOTH its base and `_ic` invocations.
+  SHAP's TreeExplainer segfaults (C-extension) on a 500-tree forest at this
+  scale. xgb/lgb/cb keep SHAP; it's stable for them.
+* **TabNet** (round 37) uses a 5% calibration eval_set for early stopping
+  (`max_epochs=50`, `patience=10`, `batch_size=4096`) — was running the full 100
+  epochs at batch 1024 with the GPU at 16% util, ~2.5 h/combo; now ~20-30 min.
+* **TabPFN** is hard-capped at ~10k training rows by its pretrained transformer;
+  the slurm sub-samples accordingly.
+* **TPOT** uses `balanced_accuracy` scoring on the multiclass band targets
+  (plain accuracy would let it win by predicting the majority class) and depends
+  on `setuptools<81` (transitive `stopit` → legacy `pkg_resources`).
+* **Survival** (`19_*`) is not currently part of the run — NTDB lacks a clean
+  time-to-death; advised to skip.
 
-## Adding more families / wider grid
+## Re-running after a code change (standard cycle)
 
-Drop a new `slurms/2X_train_<family>.slurm` (copy from a similar one), change `--model-families` and `--model-id-prefix`, then add it to `TRAIN_JOBS` in `submit_all.sh`. The aggregator picks it up automatically.
+```bash
+scp src.zip mcapo@atlas-edr.sw.ehu.es:/scratch/mcapo/trauma_ml/
+# on the cluster, with venv active:
+unzip -o src.zip
+pip install -e .          # MANDATORY after any code change
+# resubmit the affected slurms; completed combos skip via the resume tracker
+sbatch slurms/16_train_random_forest.slurm   # etc.
+```
 
-To narrow a grid (faster runs), edit the `--imputers` / `--missingness-thresholds` / `--phase-cutoffs` / `--augmentations` arguments in the slurm. The grid is the cartesian product, so dropping one option from a 3-option axis cuts walltime by ~33%.
+To verify the resume tracker is skipping (not retraining) completed work:
 
-To widen a grid, do the opposite — but watch the walltime ceiling. The current grids are sized to fit within `--time` (1-3 days depending on family).
+```bash
+ls -t slurms/logs/train_xgb_*.out | head -1 | xargs grep -c "SKIP (already completed"
+```

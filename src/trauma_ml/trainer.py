@@ -105,6 +105,25 @@ class TrainerConfig:
     tune_hparams: bool = False
     cv_folds: int = 3
     n_search_iter: int = 10
+    # Round 37: post-imputation feature gating.
+    # When True, the trainer evaluates imputer quality per feature on the
+    # CALIBRATION SET (never the test set — kept untouched for final
+    # evaluation), then drops features whose imputation fails the
+    # ``imputer_check_thresholds``.  If no features survive, all
+    # downstream metrics are emitted as NaN and training is skipped.
+    # Combined with ``imputer_method="none"`` (which lets NaN-tolerant
+    # tree models consume the raw data), this gives three regimes:
+    #   imputer_method != "none", imputer_check = False  → impute all
+    #   imputer_method != "none", imputer_check = True   → impute, drop bad
+    #   imputer_method == "none",  imputer_check = *      → skip imputation
+    imputer_check: bool = False
+    imputer_check_thresholds: dict = field(default_factory=lambda: {
+        # numeric: keep if MAE / std(train) < 0.5  (imputer at least
+        # halves uncertainty vs a "predict the variance" baseline)
+        "numeric_relative_mae_max": 0.5,
+        # categorical: keep if reconstruction accuracy > 0.7
+        "categorical_accuracy_min": 0.7,
+    })
 
 
 # Mapping predictor_type label → Catalogue registry column
@@ -151,6 +170,16 @@ class Trainer:
         self._fit_transformers_on_train()
         self._apply_transformers()
         self._fit_imputer_and_eval(outputs_root / "imputation_eval" / self.cfg.model_id)
+
+        # Round 37: imputer_check may have dropped every feature.  If so,
+        # there's nothing to model — emit NaN metrics so the resume tracker
+        # treats this combo as "done" (and won't retry), then return early.
+        if getattr(self, "_imputer_check_no_features", False):
+            log.warning("[%s] No predictors survived imputer_check — "
+                        "writing NaN metrics and skipping training.",
+                        self.cfg.model_id)
+            return self._emit_empty_run(outputs_root)
+
         self._augment_if_needed()
         self._fit_model()
         self._calibrate_if_binary()
@@ -649,52 +678,127 @@ class Trainer:
                                dtype=float).reshape(-1, 1)
             self.data.loc[non_null, col] = scaler.transform(vals).flatten()
 
+    # Round 37: families that handle NaN natively can use imputer_method="none"
+    _NAN_TOLERANT_FAMILIES = frozenset({"xgboost", "lightgbm", "catboost", "flaml"})
+
     def _fit_imputer_and_eval(self, output_dir: Path):
+        # ─── Regime 1: imputer_method == "none" ──────────────────────────
+        # Skip imputation entirely.  Only valid when the chosen model
+        # family handles NaN natively.  Round 37.
+        if self.cfg.imputer_method == "none":
+            if self.cfg.model_family not in self._NAN_TOLERANT_FAMILIES:
+                raise ValueError(
+                    f"imputer_method='none' requires a NaN-tolerant model "
+                    f"family ({sorted(self._NAN_TOLERANT_FAMILIES)}); got "
+                    f"{self.cfg.model_family!r}.  Either pick a different "
+                    f"imputer, a different family, or remove this combo "
+                    f"from the grid."
+                )
+            log.info(
+                "imputer_method='none': skipping all imputation; "
+                "%s will consume NaN-containing data directly.",
+                self.cfg.model_family,
+            )
+            self.imputer = None
+            # Still need a baseline imputer to make ISS/NISS/TRISS
+            # comparable.  Use median_mode for that — it's tangential to
+            # the model's data.
+            if hasattr(self, "_raw_baseline") and len(self._raw_baseline) > 0:
+                self._fit_baseline_imputer(method_override="median_mode")
+            return
+
+        # ─── Regime 2/3: normal imputation, optionally with feature gating ─
         self.imputer = make_imputer(
             method=self.cfg.imputer_method,
             numeric_cols=self.numeric_cols,
             categorical_cols=self.categorical_cols,
         )
         train = self.data.loc[self.splits["train"], self.predictors]
-        log.info("Fitting imputer %s on %d training rows", self.cfg.imputer_method, len(train))
+        log.info("Fitting imputer %s on %d training rows",
+                 self.cfg.imputer_method, len(train))
         self.imputer.fit(train)
-        test = self.data.loc[self.splits["test"], self.predictors]
-        evaluate_imputation(
-            test, self.imputer,
+
+        # Compute train-set std for each numeric column — needed to
+        # convert MAE into a relative MAE in the eval CSV.
+        train_std = {col: float(train[col].std(skipna=True))
+                     for col in self.numeric_cols if col in train.columns}
+
+        # Round 37: evaluate imputer quality on the CALIBRATION SET, not
+        # the test set.  Test must stay untouched until the final
+        # evaluation step.
+        calibration_df = self.data.loc[self.splits["calibration"], self.predictors]
+        log.info("Evaluating imputer on calibration set (%d rows) — "
+                 "test set untouched", len(calibration_df))
+        eval_df = evaluate_imputation(
+            calibration_df, self.imputer,
             mask_fraction=0.10,
             random_state=self.cfg.random_state,
             output_dir=output_dir,
+            train_std=train_std,
+            thresholds=self.cfg.imputer_check_thresholds,
         )
+
+        # ─── Regime 3: imputer_check — filter features by reconstruction quality ─
+        if self.cfg.imputer_check:
+            kept, dropped = select_good_features(eval_df)
+            log.info("imputer_check=True: %d features pass thresholds "
+                     "(MAE/std < %.2f for numeric, accuracy > %.2f for "
+                     "categorical); %d features dropped",
+                     len(kept),
+                     self.cfg.imputer_check_thresholds.get(
+                         "numeric_relative_mae_max", 0.5),
+                     self.cfg.imputer_check_thresholds.get(
+                         "categorical_accuracy_min", 0.7),
+                     len(dropped))
+            if dropped:
+                log.info("  dropped: %s", dropped)
+
+            if not kept:
+                # No features survive — caller will short-circuit
+                # the run via the public method below.
+                log.warning("imputer_check=True dropped ALL features; "
+                            "training will be skipped and metrics emitted as NaN")
+                self._imputer_check_no_features = True
+                # Save the eval CSV showing zero kept rows so it's clear
+                # what happened
+                self.predictors = []
+                self.numeric_cols = []
+                self.categorical_cols = []
+                # Set self.imputer to None to skip downstream imputation
+                self.imputer = None
+                return
+
+            # Filter the predictor set and refit the imputer on it
+            self.predictors = [p for p in self.predictors if p in kept]
+            self.numeric_cols = [c for c in self.numeric_cols if c in kept]
+            self.categorical_cols = [c for c in self.categorical_cols if c in kept]
+            self.imputer = make_imputer(
+                method=self.cfg.imputer_method,
+                numeric_cols=self.numeric_cols,
+                categorical_cols=self.categorical_cols,
+            )
+            train_kept = self.data.loc[self.splits["train"], self.predictors]
+            log.info("Refitting imputer on %d kept predictors", len(self.predictors))
+            self.imputer.fit(train_kept)
+
+        # ─── Apply the (possibly filtered) imputer to all partitions ───
         for part in ("train", "calibration", "test"):
             idx = self.splits[part]
             self.data.loc[idx, self.predictors] = self.imputer.transform(
                 self.data.loc[idx, self.predictors]
             ).values
-        # Also impute the temporal holdout rows so _evaluate_year_holdout
-        # can read X directly from self.data without a second transform call.
+
         if len(self.holdout_idx) > 0:
             self.data.loc[self.holdout_idx, self.predictors] = self.imputer.transform(
                 self.data.loc[self.holdout_idx, self.predictors]
             ).values
             log.debug("Imputed %d temporal holdout rows in-place", len(self.holdout_idx))
 
-        # ---- Baseline-input imputer (round 8) -----------------------------
-        # Fit a SEPARATE imputer on the raw baseline columns using the SAME
-        # method (median_mode / mice / etc.) as the model's imputer, on the
-        # SAME training rows.  We need this because:
-        # - The model's imputer is fit on `self.predictors` only, which may
-        #   not include NISS, TRAUMATYPE, etc. (those are baseline inputs,
-        #   often outside the predictor set).
-        # - We want every row in `_raw_baseline` to produce a defined ISS,
-        #   NISS, and TRISS value — even rows where one of those inputs was
-        #   originally NaN — so that the baseline metrics are computed on
-        #   the SAME population as the model metrics, per-cohort.
-        # The result is an "imputed-baseline" snapshot whose rows align 1:1
-        # with `self.data` and which has NO NaN in the baseline columns.
+        # ---- Baseline-input imputer ----------------------------------
         if hasattr(self, "_raw_baseline") and len(self._raw_baseline) > 0:
             self._fit_baseline_imputer()
 
-    def _fit_baseline_imputer(self) -> None:
+    def _fit_baseline_imputer(self, method_override: str | None = None) -> None:
         """Fit a baseline-only imputer and produce ``self._imputed_baseline``.
 
         Uses the same imputer method the user configured for the model
@@ -703,7 +807,13 @@ class Trainer:
         but with NO NaN cells in the baseline-input columns — so every
         row produces a defined ISS / NISS / TRISS in baseline_metrics().
         Categorical columns (TRAUMATYPE) get mode-imputed.
+
+        Round 37: ``method_override`` lets callers force a concrete imputer
+        method even when ``cfg.imputer_method == "none"`` (the model uses
+        no imputer, but the baselines still need defined ISS/NISS/TRISS for
+        a fair comparison — we use median_mode for those).
         """
+        baseline_method = method_override or self.cfg.imputer_method
         # Drop columns that are 100% NaN on the training set — sklearn's
         # SimpleImputer silently skips them during fit but expects them
         # absent during transform too, causing a "Columns must be same
@@ -734,7 +844,7 @@ class Trainer:
         bl_numeric     = [c for c in usable_cols if c not in bl_categorical]
 
         self._baseline_imputer = make_imputer(
-            method=self.cfg.imputer_method,
+            method=baseline_method,
             numeric_cols=bl_numeric,
             categorical_cols=bl_categorical,
         )
@@ -742,7 +852,7 @@ class Trainer:
         train_subset = train_raw_bl[usable_cols]
         log.info(
             "[%s] Fitting baseline imputer (%s) on %d training rows × %d cols (%s)",
-            self.cfg.model_id, self.cfg.imputer_method,
+            self.cfg.model_id, baseline_method,
             len(train_subset), len(usable_cols), usable_cols,
         )
         try:
@@ -2276,6 +2386,64 @@ class Trainer:
 
         return type(model).__name__
 
+    def _emit_empty_run(self, outputs_root: Path) -> "ModelArtifact":
+        """Write NaN-filled metrics + a minimal artifact when imputer_check
+        leaves no usable predictors.
+
+        This makes the run "complete" from the resume tracker's point of
+        view (it sees overall__test.json and won't retry the combo) while
+        clearly signalling, via NaN values and a flag in config.json, that
+        the combo was abandoned due to the imputer check.
+        """
+        import json as _json
+
+        metrics_dir = outputs_root / "metrics" / self.cfg.model_id
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        nan_metrics = {
+            "AUROC": None, "AUPRC": None, "Brier": None,
+            "balanced_accuracy": None, "f1": None,
+            "recall": None, "precision": None,
+            "_skipped_reason": "imputer_check removed all predictors",
+        }
+        for partition in ("train", "calibration", "test", "holdout"):
+            (metrics_dir / f"overall__{partition}.json").write_text(
+                _json.dumps(nan_metrics, indent=2)
+            )
+
+        # Minimal config.json so downstream tools can read the combo + see
+        # why it was skipped.
+        models_dir = outputs_root / "models" / self.cfg.model_id
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "config.json").write_text(_json.dumps({
+            "model_id": self.cfg.model_id,
+            "family": self.cfg.model_family,
+            "task": self.task,
+            "predictor_cols": [],
+            "numeric_cols": [],
+            "categorical_cols": [],
+            "config": {
+                "predictor_type":        self.cfg.predictor_type,
+                "phase_cutoff":          self.cfg.phase_cutoff,
+                "inclusion_strategy":    self.cfg.inclusion_strategy,
+                "imputer_method":        self.cfg.imputer_method,
+                "imputer_check":         self.cfg.imputer_check,
+                "model_family":          self.cfg.model_family,
+                "calibration":           self.cfg.calibration,
+                "missingness_threshold": self.cfg.missingness_threshold,
+                "data_augmentation":     self.cfg.data_augmentation or "none",
+                "n_predictors":          0,
+                "skipped":               True,
+                "skipped_reason":        "imputer_check removed all predictors",
+            },
+        }, indent=2))
+
+        log.info("[%s] Empty run recorded (NaN metrics + skipped flag).",
+                 self.cfg.model_id)
+        # Return a lightweight artifact-less sentinel; callers only use the
+        # return value for logging, so None-model is fine.
+        return None
+
     def _save_artifact(self, output_root: Path) -> ModelArtifact:
         actual_type = self._resolve_actual_model_type(self.model, self.cfg.model_family)
         log.info("[%s] Actual model type: %s", self.cfg.model_id, actual_type)
@@ -2299,6 +2467,7 @@ class Trainer:
                 "phase_cutoff":          self.cfg.phase_cutoff,
                 "inclusion_strategy":    self.cfg.inclusion_strategy,
                 "imputer_method":        self.cfg.imputer_method,
+                "imputer_check":         self.cfg.imputer_check,
                 "model_family":          self.cfg.model_family,
                 "calibration":           self.cfg.calibration,
                 "missingness_threshold": self.cfg.missingness_threshold,

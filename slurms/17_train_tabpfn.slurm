@@ -3,13 +3,13 @@
 #SBATCH --output=slurms/logs/train_tpf_%j.out
 #SBATCH --error=slurms/logs/train_tpf_%j.err
 #SBATCH --partition=general
-#SBATCH --qos=regular
+#SBATCH --qos=xlong
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:rtx3090:1
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
@@ -59,3 +59,28 @@ trauma-train \
     --no-aggregate \
     --n-jobs        8 \
     --verbose
+
+# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
+# Appended so they never renumber the existing tpf_* models above.
+# (a) imputer_check=True — drop features the imputer can't reconstruct
+#     on the calibration set.  Prefix tpf_ic.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       in_hospital_mortality \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
+    --imputers      median_mode mice \
+    --imputer-check \
+    --model-families tabpfn \
+    --calibrations  none platt isotonic \
+    --augmentations null smote adasyn \
+    --missingness-thresholds 10 50 \
+    --use-gpu       force \
+    --model-id-prefix tpf_ic \
+    --no-aggregate \
+    --n-jobs        8 \
+    --verbose
+
+# (b) imputer=none NOT added — tabpfn cannot consume NaN.

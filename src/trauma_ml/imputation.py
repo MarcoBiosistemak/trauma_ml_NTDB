@@ -106,12 +106,23 @@ def evaluate_imputation(
     mask_fraction: float = 0.10,
     random_state: int = 42,
     output_dir: Path | None = None,
+    train_std: dict[str, float] | None = None,
+    thresholds: dict | None = None,
 ) -> pd.DataFrame:
     """Mask a fraction of known values in ``df_test`` per variable, run the imputer
     that is already fitted on train, and record the per-variable error.
 
-    Returns a dataframe with one row per (variable, method) including:
-      n_masked, MAE (numeric) or accuracy (categorical).
+    Round 37: when ``train_std`` and ``thresholds`` are supplied, the
+    returned frame also includes:
+      - ``std_train`` — standard deviation of the column on the training
+        set (used to scale numeric MAE)
+      - ``relative_MAE`` — MAE / std_train (for numeric variables)
+      - ``keep`` — boolean indicating the imputer's reconstruction passes
+        the threshold supplied in ``thresholds``.  Used downstream when
+        ``imputer_check=True`` to filter out features the imputer can't
+        recover reliably.
+
+    Returns a dataframe with one row per (variable, method).
     """
     rng = np.random.default_rng(random_state)
     results = []
@@ -133,26 +144,43 @@ def evaluate_imputation(
 
     imputed_df = imputer.transform(masked_df)
 
+    thresholds = thresholds or {}
+    num_thresh = float(thresholds.get("numeric_relative_mae_max", float("inf")))
+    cat_thresh = float(thresholds.get("categorical_accuracy_min", -1.0))
+
     for col, mask_idx in mask_records.items():
         truth = df_test.loc[mask_idx, col].to_numpy()
         pred = imputed_df.loc[mask_idx, col].to_numpy()
         if col in numeric_set:
-            truth = truth.astype(float)
-            pred = pred.astype(float)
+            try:
+                truth = truth.astype(float)
+                pred = pred.astype(float)
+            except (ValueError, TypeError):
+                continue
             mae = float(np.mean(np.abs(truth - pred)))
             rmse = float(np.sqrt(np.mean((truth - pred) ** 2)))
+            std = (train_std or {}).get(col)
+            if std is None or std <= 0 or not np.isfinite(std):
+                std = float(np.std(truth)) if len(truth) > 1 else float("nan")
+            rel_mae = (mae / std) if std and np.isfinite(std) and std > 0 else float("nan")
+            keep = bool(np.isfinite(rel_mae) and rel_mae <= num_thresh) if thresholds else True
             results.append({
                 "variable": col, "type": "numeric",
                 "n_masked": int(len(mask_idx)),
                 "MAE": mae, "RMSE": rmse,
+                "std_train": float(std) if np.isfinite(std) else None,
+                "relative_MAE": rel_mae if np.isfinite(rel_mae) else None,
+                "keep": keep,
                 "method": imputer.method,
             })
         elif col in categorical_set:
             acc = float(np.mean(truth == pred))
+            keep = bool(acc >= cat_thresh) if thresholds else True
             results.append({
                 "variable": col, "type": "categorical",
                 "n_masked": int(len(mask_idx)),
                 "accuracy": acc,
+                "keep": keep,
                 "method": imputer.method,
             })
 
@@ -166,6 +194,20 @@ def evaluate_imputation(
         log.info("Wrote imputation evaluation to %s", csv_path)
 
     return df_out
+
+
+def select_good_features(eval_df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Split eval_df['variable'] into (kept, dropped) by the 'keep' column.
+
+    Designed to be called when ``imputer_check=True``.  Variables with
+    ``keep == True`` survive; the rest are reported so the caller can log
+    and drop them from the predictor set.
+    """
+    if eval_df.empty or "keep" not in eval_df.columns:
+        return list(eval_df.get("variable", [])), []
+    kept = eval_df.loc[eval_df["keep"] == True, "variable"].tolist()
+    dropped = eval_df.loc[eval_df["keep"] != True, "variable"].tolist()
+    return kept, dropped
 
 
 def make_imputer(

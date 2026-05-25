@@ -7,8 +7,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=20
-#SBATCH --mem=120G
-#SBATCH --time=3-00:00:00
+#SBATCH --mem=250G
+#SBATCH --time=4-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
@@ -49,8 +49,34 @@ trauma-train \
     --model-id-prefix iss_rf \
     --no-aggregate \
     --no-shap \
-    --n-jobs        20 \
+    --n-jobs        12 \
     --verbose
 
 # Round 33: --no-shap added — same SHAP segfault as the mortality
 # random_forest slurm.  See 16_train_random_forest.slurm for details.
+
+# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
+# Appended so they never renumber the existing iss_rf_* models above.
+# (a) imputer_check=True — drop features the imputer can't reconstruct
+#     on the calibration set.  Prefix iss_rf_ic.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       ISS_band \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
+    --imputers      median_mode mice \
+    --imputer-check \
+    --model-families random_forest \
+    --no-shap \
+    --calibrations  none \
+    --augmentations null \
+    --missingness-thresholds 25 50 85 \
+    --use-gpu       never \
+    --model-id-prefix iss_rf_ic \
+    --no-aggregate \
+    --n-jobs        12 \
+    --verbose
+
+# (b) imputer=none NOT added — random_forest cannot consume NaN.

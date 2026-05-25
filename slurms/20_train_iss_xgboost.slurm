@@ -52,3 +52,46 @@ trauma-train \
     --no-aggregate \
     --n-jobs        12 \
     --verbose
+
+# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
+# Appended so they never renumber the existing iss_xgb_* models above.
+# (a) imputer_check=True — drop features the imputer can't reconstruct
+#     on the calibration set.  Prefix iss_xgb_ic.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       ISS_band \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
+    --imputers      median_mode mice \
+    --imputer-check \
+    --model-families xgboost \
+    --calibrations  none \
+    --augmentations null \
+    --missingness-thresholds 25 50 85 \
+    --use-gpu       auto \
+    --model-id-prefix iss_xgb_ic \
+    --no-aggregate \
+    --n-jobs        12 \
+    --verbose
+
+# (b) imputer=none — xgboost handles NaN natively; no imputation.
+#     imputer_check irrelevant here.  Prefix iss_xgb_none.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       ISS_band \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
+    --imputers      none \
+    --model-families xgboost \
+    --calibrations  none \
+    --augmentations null \
+    --missingness-thresholds 25 50 85 \
+    --use-gpu       auto \
+    --model-id-prefix iss_xgb_none \
+    --no-aggregate \
+    --n-jobs        12 \
+    --verbose

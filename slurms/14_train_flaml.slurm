@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120G
-#SBATCH --time=3-00:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
@@ -53,6 +53,49 @@ trauma-train \
     --missingness-thresholds 10 50 \
     --use-gpu       never \
     --model-id-prefix flm \
+    --no-aggregate \
+    --n-jobs        16 \
+    --verbose
+
+# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
+# Appended so they never renumber the existing flm_* models above.
+# (a) imputer_check=True — drop features the imputer can't reconstruct
+#     on the calibration set.  Prefix flm_ic.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       in_hospital_mortality \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
+    --imputers      median_mode mice \
+    --imputer-check \
+    --model-families flaml \
+    --calibrations  none platt isotonic \
+    --augmentations null smote adasyn \
+    --missingness-thresholds 10 50 \
+    --use-gpu       never \
+    --model-id-prefix flm_ic \
+    --no-aggregate \
+    --n-jobs        16 \
+    --verbose
+
+# (b) imputer=none — flaml handles NaN natively; no imputation.
+#     imputer_check irrelevant here.  Prefix flm_none.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       in_hospital_mortality \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
+    --imputers      none \
+    --model-families flaml \
+    --calibrations  none platt isotonic \
+    --augmentations null smote adasyn \
+    --missingness-thresholds 10 50 \
+    --use-gpu       never \
+    --model-id-prefix flm_none \
     --no-aggregate \
     --n-jobs        16 \
     --verbose

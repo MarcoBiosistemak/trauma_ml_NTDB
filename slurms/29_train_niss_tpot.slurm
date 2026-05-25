@@ -1,34 +1,33 @@
 #!/bin/bash
-#SBATCH --job-name=trauma_niss_rf
-#SBATCH --output=slurms/logs/train_niss_rf_%j.out
-#SBATCH --error=slurms/logs/train_niss_rf_%j.err
+#SBATCH --job-name=trauma_niss_tpt
+#SBATCH --output=slurms/logs/train_niss_tpt_%j.out
+#SBATCH --error=slurms/logs/train_niss_tpt_%j.err
 #SBATCH --partition=general
 #SBATCH --qos=xlong
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=20
-#SBATCH --mem=250G
-#SBATCH --time=4-00:00:00
+#SBATCH --mem=200G
+#SBATCH --time=8-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
-# trauma-train on the NISS_RF family for the NISS_BAND target.
-# Multiclass classification — predicting ISS/NISS bands rather than mortality.
-# Outputs land under outputs/niss_band/ (NOT outputs/) so they don't collide
-# with the mortality run's outputs/{models,metrics,plots}/.
+# trauma-train: TPOT AutoML on NISS_band (multiclass).
+# Round 36: added FLAML/TPOT to band targets.
 #
-# Round 19: multiclass slurms.  Grid is narrower than the mortality slurms
-# because calibration (Platt/isotonic) and augmentation (SMOTE/ADASYN) do
-# not generalise cleanly to multiclass.  Baseline scores (ISS/NISS/TRISS)
-# are NOT computed by the aggregator for non-mortality targets — there's
-# nothing to compare against since the bands ARE derived from those scores.
+# TPOT scoring is balanced_accuracy on multiclass targets (round 36
+# fix in models.py) — plain accuracy would let TPOT win by predicting
+# the majority class given NISS_band's 1.7M/1.5M/261k/404k imbalance.
+#
+# Round 35 settings carry over: GA on 20% subsample (288k rows),
+# winner re-fit on full data, cv=3, max_time_mins=15, early_stop=3.
+# Per-combo wall-clock ≈ 10-20 min; full 12-combo grid ≈ 4-6 h.
 
 set -euo pipefail
 mkdir -p slurms/logs
 
 module purge
 module load Python/3.10.4-GCCcore-11.3.0
-module load CUDA/12.1.1
 source "/scratch/${USER}/trauma_ml_venv/bin/activate"
 
 echo "[INFO] Slurm job ${SLURM_JOB_ID} on $(hostname)"
@@ -41,24 +40,20 @@ trauma-train \
     --predictor-types "Tran NTDB" \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" \
     --imputers      median_mode mice \
-    --model-families random_forest \
+    --model-families tpot \
     --calibrations  none \
     --augmentations null \
     --missingness-thresholds 25 50 85 \
     --use-gpu       never \
-    --model-id-prefix niss_rf \
+    --model-id-prefix niss_tpt \
     --no-aggregate \
-    --no-shap \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose
 
-# Round 33: --no-shap added — same SHAP segfault as the mortality
-# random_forest slurm.  See 16_train_random_forest.slurm for details.
-
 # ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
-# Appended so they never renumber the existing niss_rf_* models above.
+# Appended so they never renumber the existing niss_tpt_* models above.
 # (a) imputer_check=True — drop features the imputer can't reconstruct
-#     on the calibration set.  Prefix niss_rf_ic.
+#     on the calibration set.  Prefix niss_tpt_ic.
 trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
@@ -68,15 +63,14 @@ trauma-train \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" \
     --imputers      median_mode mice \
     --imputer-check \
-    --model-families random_forest \
-    --no-shap \
+    --model-families tpot \
     --calibrations  none \
     --augmentations null \
     --missingness-thresholds 25 50 85 \
     --use-gpu       never \
-    --model-id-prefix niss_rf_ic \
+    --model-id-prefix niss_tpt_ic \
     --no-aggregate \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose
 
-# (b) imputer=none NOT added — random_forest cannot consume NaN.
+# (b) imputer=none NOT added — tpot cannot consume NaN.

@@ -60,30 +60,62 @@ def _parse_target_defs(target_cfg: list[dict]) -> dict[str, TargetSpec]:
 def _build_grid(
     targets, predictor_types, phase_cutoffs, inclusion_strategies,
     imputers, model_families, calibrations, missingness_thresholds, augmentations,
+    imputer_checks=(False,),
 ):
+    """Enumerate the experiment grid.
+
+    Round 37: ``imputer_checks`` is the LAST axis in itertools.product so
+    that adding ``True`` to it appends new combos at the END of the model_id
+    sequence, leaving every previously-assigned model_id unchanged.  This
+    is what lets you keep already-run results and only train the new combos.
+
+    Two skip rules keep the grid sane:
+      - ``imputer_method == "none"`` is only valid for NaN-tolerant
+        families (xgboost / lightgbm / catboost / flaml).  Other families
+        are skipped.
+      - When ``imputer_method == "none"`` there is no imputation to check,
+        so the ``imputer_check`` dimension collapses — we only keep the
+        ``imputer_check == False`` variant (point 5).  This prevents
+        duplicate identical runs.
+    """
+    NAN_TOLERANT = {"xgboost", "lightgbm", "catboost", "flaml"}
     grid = []
-    combos = itertools.product(
-        targets, predictor_types, phase_cutoffs, inclusion_strategies,
-        imputers, model_families, calibrations, missingness_thresholds, augmentations,
-    )
-    for (target, ptype, phase, incl, imp, family, calib, missing, aug) in combos:
-        if aug is not None and target != "in_hospital_mortality":
-            continue
-        if calib != "none" and target != "in_hospital_mortality":
-            continue
-        if family == "tabpfn" and imp == "none":
-            continue
-        grid.append({
-            "target":                target,
-            "predictor_type":        ptype,
-            "phase_cutoff":          phase,
-            "inclusion_strategy":    incl,
-            "imputer_method":        imp,
-            "model_family":          family,
-            "calibration":           calib,
-            "missingness_threshold": missing / 100.0,
-            "data_augmentation":     aug,
-        })
+    # imputer_checks is the OUTERMOST loop: all imputer_check=False combos
+    # are enumerated first (in exactly the order they had before this axis
+    # existed), then all imputer_check=True combos are appended.  This is
+    # what guarantees existing model_ids are byte-for-byte unchanged when
+    # you add --imputer-check to a slurm you've already partly run.
+    for imp_check in imputer_checks:
+        combos = itertools.product(
+            targets, predictor_types, phase_cutoffs, inclusion_strategies,
+            imputers, model_families, calibrations, missingness_thresholds,
+            augmentations,
+        )
+        for (target, ptype, phase, incl, imp, family, calib, missing,
+             aug) in combos:
+            if aug is not None and target != "in_hospital_mortality":
+                continue
+            if calib != "none" and target != "in_hospital_mortality":
+                continue
+            # imputer=none only for NaN-tolerant families
+            if imp == "none" and family not in NAN_TOLERANT:
+                continue
+            # Point 5: with no imputation there's nothing to check — keep
+            # only the imputer_check=False variant to avoid duplicate runs.
+            if imp == "none" and imp_check:
+                continue
+            grid.append({
+                "target":                target,
+                "predictor_type":        ptype,
+                "phase_cutoff":          phase,
+                "inclusion_strategy":    incl,
+                "imputer_method":        imp,
+                "model_family":          family,
+                "calibration":           calib,
+                "missingness_threshold": missing / 100.0,
+                "data_augmentation":     aug,
+                "imputer_check":         imp_check,
+            })
     return grid
 
 
@@ -139,7 +171,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument("--inclusion-strategies", nargs="+", default=None)
-    parser.add_argument("--imputers", nargs="+", default=None)
+    parser.add_argument("--imputers", nargs="+", default=None,
+                         help="Imputer methods. Use 'none' to skip imputation "
+                              "(only valid for NaN-tolerant families: xgboost, "
+                              "lightgbm, catboost, flaml).")
+    parser.add_argument("--imputer-check", action="store_true",
+                         help="After fitting the imputer, evaluate per-feature "
+                              "reconstruction quality on the CALIBRATION set and "
+                              "drop features the imputer can't recover reliably. "
+                              "Adds imputer_check=True combos to the grid (the "
+                              "imputer_check=False combos are always included so "
+                              "your existing results stay valid).")
     parser.add_argument("--model-families", nargs="+", default=None)
     parser.add_argument("--calibrations", nargs="+", default=None,
                          choices=["none", "platt", "isotonic"])
@@ -264,9 +306,15 @@ def main(argv: list[str] | None = None) -> None:
     augmentations = [None if a in (None, "none", "None", "null") else a
                       for a in augmentations_raw]
 
+    # Round 37: imputer_check axis.  Always include False (so existing
+    # results remain valid and keep their model_ids); add True only when
+    # --imputer-check is passed.  True combos enumerate LAST.
+    imputer_checks = (False, True) if args.imputer_check else (False,)
+
     grid = _build_grid(
         targets, predictor_types, phase_cutoffs, inclusion_strategies,
         imputers, model_families, calibrations, missingness_thresholds, augmentations,
+        imputer_checks=imputer_checks,
     )
     log.info("Full grid has %d combinations", len(grid))
 
@@ -360,6 +408,7 @@ def main(argv: list[str] | None = None) -> None:
             phase_cutoff=combo["phase_cutoff"],
             inclusion_strategy=combo["inclusion_strategy"],
             imputer_method=combo["imputer_method"],
+            imputer_check=combo.get("imputer_check", False),
             model_family=combo["model_family"],
             calibration=combo["calibration"],
             missingness_threshold=combo["missingness_threshold"],

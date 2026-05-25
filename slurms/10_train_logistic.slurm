@@ -61,3 +61,28 @@ trauma-train \
     --no-aggregate \
     --n-jobs        16 \
     --verbose
+
+# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
+# Appended so they never renumber the existing lgr_* models above.
+# (a) imputer_check=True — drop features the imputer can't reconstruct
+#     on the calibration set.  Prefix lgr_ic.
+trauma-train \
+    --dataset       outputs/datasets/unified_train.parquet \
+    --holdout-dataset outputs/datasets/unified_holdout.parquet \
+    --targets       in_hospital_mortality \
+    --inclusion-strategies "Tran NTDB" \
+    --predictor-types "Tran NTDB" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
+    --imputers      median_mode mice \
+    --imputer-check \
+    --model-families logistic_l1 logistic_elasticnet \
+    --calibrations  none platt isotonic \
+    --augmentations null smote adasyn \
+    --missingness-thresholds 10 50 \
+    --use-gpu       never \
+    --model-id-prefix lgr_ic \
+    --no-aggregate \
+    --n-jobs        16 \
+    --verbose
+
+# (b) imputer=none NOT added — logistic_l1 cannot consume NaN.
