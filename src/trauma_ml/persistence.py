@@ -117,7 +117,11 @@ class ModelArtifact:
         # 3) Imputer — only over predictor columns
         missing = [c for c in self.predictor_cols if c not in df.columns]
         if missing:
-            raise KeyError(f"New data missing predictors: {missing}")
+            # Fill missing columns with NaN — XGBoost (and other NaN-native
+            # families) handle them natively.  For imputer!=none models the
+            # imputer will fill them in the next step.
+            for c in missing:
+                df[c] = np.nan
         X = df[self.predictor_cols]
         if self.imputer is not None:
             X = self.imputer.transform(X)

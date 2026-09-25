@@ -35,7 +35,7 @@ from .imputation import evaluate_imputation, make_imputer
 from .inclusion import get_strategy
 from .models import build_model
 from .persistence import ModelArtifact
-from .plots import save_model_plots
+from .plots import save_model_plots, plot_slice
 from .splitting import assign_age_group, extract_holdout_years, stratified_split
 from .targets import TargetSpec, build_target, encode_classes
 
@@ -87,7 +87,7 @@ class TrainerConfig:
     # year axis is added automatically; keep the rest here for reference
     subgroup_axes: list[str] = field(default_factory=lambda: [
         "gender", "age_group", "__admission_year",
-        "ethnicity", "race", "mechanism", "intent",
+        "ethnicity", "race", "mechanism", "intent", "insurance",
     ])
     generate_plots: bool = True
     # Round 16: SHAP can segfault on glibc<2.28 with large RF / boosting
@@ -95,6 +95,25 @@ class TrainerConfig:
     enable_shap: bool = True
     random_state: int = 42
     n_jobs: int = 4
+    # Round 53: bootstrap confidence intervals for the metrics.  0 = off
+    # (default).  When >0, evaluate() attaches <metric>__ci_low/__ci_high to the
+    # overall test + holdout (+ cohort) metric JSONs via a stratified percentile
+    # bootstrap.  Most valuable for subgroups / small external cohorts; on the
+    # full NTDB partitions the CIs are very tight and the resampling dominates.
+    n_bootstrap: int = 0
+    ci_alpha: float = 0.05
+    # Round 58: light bootstrap used ONLY to annotate the binary ROC/PR plot
+    # legends with AUROC/AUPRC confidence intervals.  Independent of
+    # n_bootstrap (which controls the heavier all-metric JSON CIs): the legend
+    # CIs are ON by default with this many resamples.  Set to 0 to disable, or
+    # it is overridden by n_bootstrap when --bootstrap-ci is larger.
+    plot_ci_bootstrap: int = 200
+    # Round 59: pre-model feature pre-filter (applies to ALL families/targets).
+    # Drops near-zero-variance columns and one of each near-perfectly-correlated
+    # / duplicate pair, computed on the TRAINING split only (no leakage).
+    prefilter: bool = True
+    nzv_dominant_frac: float = 0.999      # drop if one value covers >= this frac
+    corr_drop_threshold: float = 0.9999   # drop one of a pair with |r| >= this
     # round 12: GPU policy for model factories that support it
     # ("auto" — use GPU if available, "force" — require GPU, "never" — CPU)
     use_gpu: str = "auto"
@@ -121,8 +140,12 @@ class TrainerConfig:
         # numeric: keep if MAE / std(train) < 0.5  (imputer at least
         # halves uncertainty vs a "predict the variance" baseline)
         "numeric_relative_mae_max": 0.5,
-        # categorical: keep if reconstruction accuracy > 0.7
-        "categorical_accuracy_min": 0.7,
+        # categorical: keep if BALANCED reconstruction accuracy >= 0.6.
+        # Balanced accuracy = mean per-class recall, so 0.5 is the binary
+        # no-skill floor (a majority/mode imputer scores ~0.5); 0.6 requires
+        # the imputer to recover the minority category meaningfully better
+        # than chance before the feature is trusted.  Tune per cohort.
+        "categorical_balanced_accuracy_min": 0.6,
     })
 
 
@@ -150,6 +173,8 @@ class Trainer:
         self.imputer = None
         self.model = None
         self.calibrated_models: dict[str, Any] = {}
+        self._augmented_X = None
+        self._augmented_y = None
         self.target_inverse: dict[int, Any] = {}
         self.y_all: np.ndarray | None = None
         self.task: str = "binary"
@@ -160,31 +185,78 @@ class Trainer:
     # ================================================================= #
     def run(self, outputs_root: Path) -> ModelArtifact:
         outputs_root = Path(outputs_root)
+        if not self.prepare(outputs_root):
+            # Round 37: imputer_check may have dropped every feature.  If so,
+            # there's nothing to model — emit NaN metrics so the resume tracker
+            # treats this combo as "done" (and won't retry), then return early.
+            log.warning("[%s] No predictors survived imputer_check — "
+                        "writing NaN metrics and skipping training.",
+                        self.cfg.model_id)
+            return self._emit_empty_run(outputs_root)
+        return self.fit_evaluate_save(outputs_root)
+
+    # ----------------------------------------------------------------- #
+    # Round 61: run() is split into a *preprocessing* stage (prepare) and a
+    # *model* stage (fit_evaluate_save).  The preprocessing stage depends only
+    # on (target, predictor_type, phase, inclusion, missingness, imputer,
+    # imputer_check, family) — NOT on calibration or augmentation — so the
+    # experiment runner fits the encoders+imputer ONCE and reuses them across
+    # every calibration/augmentation variant (see cli/run_experiments.py).
+    # The fitted objects are still bundled into EVERY saved artifact, so
+    # deployment of any single model_id is unaffected.
+    # ----------------------------------------------------------------- #
+    def prepare(self, outputs_root: Path) -> bool:
+        """Preprocessing shared across calibration/augmentation variants.
+
+        Returns ``False`` if ``imputer_check`` dropped every predictor (the
+        caller then emits an empty run); ``True`` otherwise.
+        """
+        outputs_root = Path(outputs_root)
         self._load_and_filter()
         self._build_target()
         self._select_predictors()
         self._drop_high_missingness()
         self._split()                          # extracts temporal holdout first
+        self._prefilter_predictors()           # round 59: NZV + correlated-pair drop
         self._snapshot_raw_baseline_cols()     # save ISS/NISS/TRISS before scaling
         self._snapshot_raw_missingness()       # save predictor NaN mask before imputation
         self._fit_transformers_on_train()
         self._apply_transformers()
         self._fit_imputer_and_eval(outputs_root / "imputation_eval" / self.cfg.model_id)
+        self._prepared = True
+        return not getattr(self, "_imputer_check_no_features", False)
 
-        # Round 37: imputer_check may have dropped every feature.  If so,
-        # there's nothing to model — emit NaN metrics so the resume tracker
-        # treats this combo as "done" (and won't retry), then return early.
-        if getattr(self, "_imputer_check_no_features", False):
-            log.warning("[%s] No predictors survived imputer_check — "
-                        "writing NaN metrics and skipping training.",
-                        self.cfg.model_id)
-            return self._emit_empty_run(outputs_root)
+    def fit_evaluate_save(self, outputs_root: Path,
+                          cached_base_model=None) -> ModelArtifact:
+        """Model stage: augment -> fit (or reuse a cached base) -> calibrate
+        -> evaluate -> save.
 
-        self._augment_if_needed()
-        self._fit_model()
+        ``cached_base_model`` lets the runner reuse the UNCALIBRATED model
+        across calibration variants of the same (family, augmentation): the
+        full pipeline up to and including model training is identical for
+        none/platt/isotonic — only the post-hoc calibrator on the calibration
+        set differs.  When supplied, augmentation + training are skipped.
+        """
+        outputs_root = Path(outputs_root)
+        if cached_base_model is not None:
+            self.model = cached_base_model     # reuse trained base; skip augment+fit
+        else:
+            self._augment_if_needed()
+            self._fit_model()
         self._calibrate_if_binary()
         self._evaluate(outputs_root / "metrics" / self.cfg.model_id, outputs_root)
         return self._save_artifact(outputs_root / "models")
+
+    def reset_for_next_combo(self, cfg) -> None:
+        """Reuse this *already-prepared* Trainer for another combo that shares
+        the same preprocessing.  Clears ONLY the per-combo mutable state; the
+        fitted transformers/imputer, splits, imputed data and holdout state are
+        kept intact (that is the whole point of the cache)."""
+        self.cfg = cfg
+        self.model = None
+        self._augmented_X = None
+        self._augmented_y = None
+        self.calibrated_models = {}
 
     # ================================================================= #
     # Steps
@@ -257,6 +329,16 @@ class Trainer:
             it_actual = col_lower_to_actual.get("intent")
             if it_actual is not None:
                 self.data["intent"] = self.data[it_actual]
+        # Round 57: sociodemographic 'insurance' subgroup axis from the NTDB
+        # primary-payer codes (used for equity/fairness reporting per target).
+        if "insurance" not in self.data.columns:
+            pay_actual = col_lower_to_actual.get("primarymethodpayment")
+            if pay_actual is not None:
+                self.data["insurance"] = self.data[pay_actual].map({
+                    1: "Medicaid", 2: "Not Billed", 3: "Self-Pay",
+                    4: "Private/Commercial", 6: "Medicare",
+                    7: "Other Government", 10: "Other",
+                })
 
         mask_valid = self.data["gender"].notna()
         n_dropped = (~mask_valid).sum()
@@ -325,7 +407,7 @@ class Trainer:
         y = build_target(self.data, self.cfg.target)
         self.data = self.data.loc[y.notna()].reset_index(drop=True)
         y = y.loc[y.notna()].reset_index(drop=True)
-        if self.cfg.target.kind == "binary":
+        if self.cfg.target.kind in ("binary", "binary_threshold"):
             self.task = "binary"
             self.y_all = y.astype(int).to_numpy()
             self.target_inverse = {0: "negative", 1: "positive"}
@@ -344,6 +426,10 @@ class Trainer:
 
     def _select_predictors(self):
         registry = PREDICTOR_TYPE_TO_REGISTRY.get(self.cfg.predictor_type, None)
+        # Injury-description features (Barell/INJ_*) are discharge-coded, so
+        # they are only available at the in-hospital cutoff — for BOTH the
+        # mortality target and the ISS_band / NISS_band targets.  (ISS / NISS
+        # themselves are still removed below via target_cols for band targets.)
         whitelist = self.cfg.catalogue.variables_for(
             phase_cutoff=self.cfg.phase_cutoff,
             registries=[registry] if registry else None,
@@ -353,9 +439,10 @@ class Trainer:
         if self.cfg.target.kind == "binary":
             target_cols.update({"HOSPDISCHARGEDISPOSITION", "EDDISCHARGEDISPOSITION",
                                  "DEATHINED"})
-        elif self.cfg.target.kind == "ordinal_bands":
+        elif self.cfg.target.kind in ("ordinal_bands", "binary_threshold"):
             source = self.cfg.target.spec.get("variable") or self.cfg.target.spec.get("derive_from")
-            target_cols.add(source)
+            if source:
+                target_cols.add(source)
             target_cols.update({"ISS", "ISS_05", "NISS"})
 
         # Round 18 defense-in-depth: even though NON_PREDICTOR_COLUMNS is
@@ -386,6 +473,30 @@ class Trainer:
             if actual is None:
                 continue
             self.predictors.append(actual)
+
+        # ── Faithful Doshi ICD families: the raw ICD code-list column is NOT
+        # in the normal whitelist; inject it here (in-hospital only).  Other
+        # families never receive it.
+        from .catalogue import PASSTHROUGH_COLUMNS
+        fam = self.cfg.model_family
+        if fam in ("doshi_ffnn_icd", "doshi_ffnn_icd_plus"):
+            icd_actual = col_lower_to_actual.get("icd_diag_codes")
+            is_l3 = "in-hospital" in self.cfg.phase_cutoff.lower()
+            if icd_actual is not None and is_l3:
+                if fam == "doshi_ffnn_icd":
+                    self.predictors = [icd_actual]              # ICD ONLY (faithful)
+                elif icd_actual not in self.predictors:
+                    self.predictors.append(icd_actual)          # ICD + other L3
+            else:
+                log.warning("[%s] ICD family needs the in-hospital cutoff and the "
+                            "ICD_DIAG_CODES column; not available (phase=%r) — "
+                            "predictors left as-is/empty.",
+                            self.cfg.model_id, self.cfg.phase_cutoff)
+                if fam == "doshi_ffnn_icd":
+                    self.predictors = []
+        else:
+            self.predictors = [p for p in self.predictors
+                               if p not in PASSTHROUGH_COLUMNS]
 
         log.info("Selected %d predictors (whitelist=%d, parquet has %d cols)",
                  len(self.predictors), len(whitelist), len(self.data.columns))
@@ -452,6 +563,8 @@ class Trainer:
         "ISS", "ISS_05", "NISS",
         "GCSTOTAL", "SBPFIRST", "RRFIRST",
         "AGEYEARS", "TRAUMATYPE",
+        # Round 52: extra physiology for the mREMS baseline
+        "PULSERATE", "PULSEOXIMETRY",
     )
 
     # ----------------------------------------------------------------- #
@@ -552,6 +665,82 @@ class Trainer:
                 required.add("TRAUMATYPE")
         return sorted(required)
 
+    def _prefilter_predictors(self) -> None:
+        """Drop degenerate predictors BEFORE modelling (all families/targets).
+
+        Two rules, both computed on the TRAINING split only (no leakage):
+          1. near-zero variance — constant, all-missing, or a single value that
+             covers >= ``nzv_dominant_frac`` of the non-missing training rows;
+          2. redundancy — one of each near-perfectly correlated numeric pair
+             (|Pearson| >= ``corr_drop_threshold``) and any exact-duplicate
+             column (kept: the first occurrence).
+        Every removal is logged to the console with its reason.
+        """
+        if not getattr(self.cfg, "prefilter", True):
+            return
+        from .catalogue import is_passthrough
+        train_idx = self.splits["train"]
+        scan_cols = [c for c in self.predictors if not is_passthrough(c)]
+        df = self.data.loc[train_idx, scan_cols]
+        dropped: dict[str, str] = {}
+
+        # 1) near-zero variance / constant / all-missing
+        for col in scan_cols:
+            nn = df[col].dropna()
+            if len(nn) == 0:
+                dropped[col] = "all-missing on the training split"
+                continue
+            if nn.nunique() <= 1:
+                dropped[col] = f"constant on train (single value {nn.iloc[0]!r})"
+                continue
+            top = nn.value_counts(normalize=True).iloc[0]
+            if top >= self.cfg.nzv_dominant_frac:
+                dropped[col] = (f"near-zero variance (one value covers "
+                                f"{top*100:.2f}% of train rows >= "
+                                f"{self.cfg.nzv_dominant_frac*100:.2f}%)")
+
+        survivors = [c for c in scan_cols if c not in dropped]
+
+        # 2a) near-perfect numeric correlation
+        num = [c for c in survivors
+               if pd.api.types.is_numeric_dtype(self.data[c])]
+        if len(num) >= 2:
+            corr = df[num].corr(numeric_only=True).abs()
+            for i, a in enumerate(num):
+                if a in dropped:
+                    continue
+                for b in num[i + 1:]:
+                    if b in dropped:
+                        continue
+                    r = corr.loc[a, b]
+                    if pd.notna(r) and r >= self.cfg.corr_drop_threshold:
+                        dropped[b] = (f"near-perfectly correlated (|r|={r:.4f} "
+                                      f">= {self.cfg.corr_drop_threshold}) with "
+                                      f"kept '{a}'")
+
+        # 2b) exact-duplicate columns (any dtype), NaN-aware
+        seen: dict[bytes, str] = {}
+        for col in [c for c in survivors if c not in dropped]:
+            key = pd.util.hash_pandas_object(
+                df[col].astype("object").where(df[col].notna(), "__NA__"),
+                index=False).values.tobytes()
+            if key in seen:
+                dropped[col] = f"exact duplicate of kept '{seen[key]}'"
+            else:
+                seen[key] = col
+
+        if dropped:
+            log.info("[%s] pre-filter removed %d/%d predictors:",
+                     self.cfg.model_id, len(dropped), len(self.predictors))
+            for col, reason in dropped.items():
+                log.info("    - %-28s %s", col, reason)
+        else:
+            log.info("[%s] pre-filter: no predictors removed "
+                     "(%d predictors retained)", self.cfg.model_id,
+                     len(self.predictors))
+        self.predictors = [c for c in self.predictors if c not in dropped]
+        self._prefilter_dropped = dropped
+
     def _snapshot_raw_baseline_cols(self) -> None:
         """Save a copy of the raw (pre-scaling) score columns used by baselines.
 
@@ -595,6 +784,50 @@ class Trainer:
             {c: len(v) for c, v in resolved.items()},
         )
 
+        # ── Round 59: phase-complete slice ──────────────────────────────
+        # Build the incremental phase blocks (on_scene / ed_arrival /
+        # in_hospital) up to this run's cutoff, keep only predictors that
+        # actually survived selection + pre-filter, and snapshot a per-row
+        # boolean mask = "row has >=1 REAL (pre-imputation) value in EVERY
+        # block".  Reused for the test AND holdout phase-complete metrics/plots.
+        try:
+            blocks = self.cfg.catalogue.incremental_phase_blocks(
+                phase_cutoff=self.cfg.phase_cutoff,
+                include_target_derivers=False)
+        except Exception as exc:                       # never fatal
+            log.warning("[%s] phase-block resolution failed: %s",
+                        self.cfg.model_id, exc)
+            blocks = {}
+        pred_set = set(self.predictors)
+        self._phase_blocks: dict[str, list[str]] = {
+            name: [c for c in cols if c in pred_set]
+            for name, cols in blocks.items()
+        }
+        self._phase_blocks = {k: v for k, v in self._phase_blocks.items() if v}
+        self._phase_complete_mask: pd.Series = self._phase_complete_mask_for(self.data)
+        if self._phase_blocks:
+            n_keep = int(self._phase_complete_mask.sum())
+            log.info(
+                "[%s] phase-complete slice: blocks=%s -> %d/%d rows (%.1f%%) "
+                "have >=1 real value in every block",
+                self.cfg.model_id,
+                {k: len(v) for k, v in self._phase_blocks.items()},
+                n_keep, len(self.data),
+                100.0 * n_keep / max(len(self.data), 1))
+
+    def _phase_complete_mask_for(self, frame: pd.DataFrame) -> pd.Series:
+        """Boolean mask over ``frame``: True where the row has at least one
+        non-NaN (pre-imputation) value in EVERY resolved phase block.  Blocks
+        with no columns present in ``frame`` are skipped.  If no blocks resolve,
+        returns all-True (slice == full set)."""
+        mask = pd.Series(True, index=frame.index)
+        for _name, cols in getattr(self, "_phase_blocks", {}).items():
+            cols = [c for c in cols if c in frame.columns]
+            if not cols:
+                continue
+            mask &= frame[cols].notna().any(axis=1)
+        return mask
+
     def _fit_transformers_on_train(self):
         train_idx = self.splits["train"]
         train = self.data.loc[train_idx, self.predictors]
@@ -602,9 +835,12 @@ class Trainer:
         # Round 26: import the semantic-categorical override
         from .catalogue import is_semantic_categorical
 
+        from .catalogue import is_passthrough
         self.numeric_cols = []
         self.categorical_cols = []
         for col in self.predictors:
+            if is_passthrough(col):
+                continue  # ICD code-list handled by the model, not transformers
             # Force semantic categoricals (SEX, TRAUMATYPE, comorbidity flags)
             # into categorical_cols regardless of stored dtype — median-imputing
             # SEX (1=Male, 2=Female) makes no sense.
@@ -679,7 +915,8 @@ class Trainer:
             self.data.loc[non_null, col] = scaler.transform(vals).flatten()
 
     # Round 37: families that handle NaN natively can use imputer_method="none"
-    _NAN_TOLERANT_FAMILIES = frozenset({"xgboost", "lightgbm", "catboost", "flaml"})
+    _NAN_TOLERANT_FAMILIES = frozenset({"xgboost", "lightgbm", "catboost", "flaml",
+                                        "doshi_ffnn_icd"})
 
     def _fit_imputer_and_eval(self, output_dir: Path):
         # ─── Regime 1: imputer_method == "none" ──────────────────────────
@@ -742,13 +979,13 @@ class Trainer:
         if self.cfg.imputer_check:
             kept, dropped = select_good_features(eval_df)
             log.info("imputer_check=True: %d features pass thresholds "
-                     "(MAE/std < %.2f for numeric, accuracy > %.2f for "
+                     "(MAE/std < %.2f for numeric, balanced_accuracy >= %.2f for "
                      "categorical); %d features dropped",
                      len(kept),
                      self.cfg.imputer_check_thresholds.get(
                          "numeric_relative_mae_max", 0.5),
                      self.cfg.imputer_check_thresholds.get(
-                         "categorical_accuracy_min", 0.7),
+                         "categorical_balanced_accuracy_min", 0.6),
                      len(dropped))
             if dropped:
                 log.info("  dropped: %s", dropped)
@@ -897,12 +1134,29 @@ class Trainer:
             self._imputed_baseline = None
 
     def _augment_if_needed(self):
-        if self.task != "binary" or self.cfg.data_augmentation is None:
+        if self.cfg.data_augmentation is None:
+            return
+        # SMOTE / ADASYN support BINARY and MULTICLASS (they oversample every
+        # minority class up to the majority), so allow both.  Calibration is a
+        # separate, binary-only step and is gated elsewhere.
+        if self.task not in ("binary", "multiclass"):
             return
         train_idx = self.splits["train"]
         X = self.data.loc[train_idx, self.predictors]
         y = self.y_all[train_idx.to_numpy()]
         method = self.cfg.data_augmentation.lower()
+        # SMOTE/ADASYN cannot consume NaN.  self.data is imputed in place for
+        # every imputer EXCEPT 'none' (NaN-native model), so an augmentation +
+        # imputer='none' combo would otherwise crash here.  Skip gracefully and
+        # train un-augmented rather than failing the whole run.
+        if hasattr(X, "isnull") and bool(X.isnull().to_numpy().any()):
+            log.warning(
+                "[%s] data_augmentation=%s skipped: training matrix still has "
+                "NaN (imputer_method='none'). Pair augmentation with "
+                "median_mode/mice to enable it.",
+                self.cfg.model_id, method,
+            )
+            return
         try:
             if method == "smote":
                 from imblearn.over_sampling import SMOTE
@@ -916,7 +1170,13 @@ class Trainer:
         except ImportError:
             log.warning("imbalanced-learn missing; install with `pip install 'trauma_ml[imbalance]'`")
             return
-        log.info("Augmented training set %d -> %d rows via %s", len(X), len(X2), method)
+        except ValueError as exc:
+            # e.g. a class with fewer samples than k_neighbors — skip, don't crash.
+            log.warning("[%s] data_augmentation=%s skipped (resample failed: %s)",
+                        self.cfg.model_id, method, exc)
+            return
+        log.info("Augmented training set %d -> %d rows via %s (%d classes)",
+                 len(X), len(X2), method, len(np.unique(y)))
         self._augmented_X = X2
         self._augmented_y = y2
 
@@ -1091,7 +1351,8 @@ class Trainer:
         for part in ("train", "calibration", "test"):
             X = self.data.loc[self.splits[part], self.predictors]
             y = self.y_all[self.splits[part].to_numpy()]
-            metrics = evaluate(self.model, X, y, task=self.task, classes=self.classes)
+            metrics = evaluate(self.model, X, y, task=self.task, classes=self.classes,
+                               n_bootstrap=self.cfg.n_bootstrap, ci_alpha=self.cfg.ci_alpha)
             save_metrics(metrics, output_dir, f"overall__{part}.json")
             for cal_name, cal_model in self.calibrated_models.items():
                 if cal_model is None:
@@ -1229,7 +1490,14 @@ class Trainer:
             # to the missing dashed lines in user's plots.
             baseline_scores_test = None
             baseline_scores_holdout = None
-            if self.task == "binary":
+            # Baseline OVERLAYS (ISS/NISS/TRISS/RTS/MGAP/mREMS dashed curves)
+            # only for the MORTALITY target.  For ISS/NISS-band binary targets
+            # the ISS/NISS baseline IS (derived from) the label, so its overlay
+            # would be a trivially near-perfect, misleading curve — and we emit
+            # no baseline METRICS for them either (see _evaluate_baselines).
+            # The model's own ROC/PR figures are still produced below for every
+            # binary task, including the band-binary ones.
+            if self.task == "binary" and self.cfg.target.kind == "binary":
                 try:
                     baseline_scores_test = self._build_baseline_scores_for(
                         self.splits["test"]
@@ -1276,7 +1544,93 @@ class Trainer:
                 enable_shap=self.cfg.enable_shap,
                 baseline_scores_test=baseline_scores_test,
                 baseline_scores_holdout=baseline_scores_holdout,
+                # Legend CIs: use the heavy --bootstrap-ci value if the user set
+                # one, else the light default (plot_ci_bootstrap).  ROC/PR only
+                # render for binary targets, so this cost is binary-only.
+                n_bootstrap=max(self.cfg.n_bootstrap, self.cfg.plot_ci_bootstrap),
+                ci_alpha=self.cfg.ci_alpha,
+                bootstrap_seed=self.cfg.random_state,
             )
+
+            # ---- Round 59: phase-complete evaluation slice -------------
+            # Metrics + figures restricted to rows with >=1 REAL (non-imputed)
+            # value in EVERY phase block up to this run's cutoff.
+            try:
+                self._evaluate_phase_complete_slice(
+                    output_dir=output_dir,
+                    plots_dir=outputs_root / "plots" / self.cfg.model_id,
+                    X_te=X_te, y_te=y_te, X_ho=X_ho, y_ho=y_ho,
+                    baseline_scores_test=baseline_scores_test,
+                    baseline_scores_holdout=baseline_scores_holdout,
+                    class_names=class_names or None,
+                )
+            except Exception as exc:
+                log.warning("[%s] phase-complete slice failed: %s",
+                            self.cfg.model_id, exc, exc_info=True)
+
+    def _evaluate_phase_complete_slice(
+        self, output_dir, plots_dir, X_te, y_te, X_ho, y_ho,
+        baseline_scores_test=None, baseline_scores_holdout=None,
+        class_names=None,
+    ) -> None:
+        """Write metrics JSON + figures for the phase-complete slice (test and,
+        when available, holdout).  No-op when no phase blocks resolved."""
+        if not getattr(self, "_phase_blocks", None):
+            return
+
+        def _mask_baselines(bs, mask):
+            if not bs:
+                return None
+            return {k: np.asarray(v)[mask] for k, v in bs.items()}
+
+        # ---- TEST slice ----
+        te_mask = self._phase_complete_mask.loc[self.splits["test"]].to_numpy()
+        n_te = int(te_mask.sum())
+        if n_te > 0:
+            Xs, ys = X_te[te_mask], y_te[te_mask]
+            m = evaluate(self.model, Xs, ys, task=self.task, classes=self.classes,
+                         n_bootstrap=self.cfg.n_bootstrap, ci_alpha=self.cfg.ci_alpha)
+            m["n_phase_complete_rows"] = n_te
+            m["n_full_rows"] = int(len(te_mask))
+            m["phase_blocks"] = {k: list(v) for k, v in self._phase_blocks.items()}
+            save_metrics(m, output_dir, "overall__test__phase_complete.json")
+            if self.cfg.generate_plots:
+                plot_slice(self.model, Xs, ys, plots_dir, self.cfg.model_id,
+                           "test__phase_complete",
+                           baseline_scores=_mask_baselines(baseline_scores_test, te_mask),
+                           class_names=class_names,
+                           n_bootstrap=max(self.cfg.n_bootstrap, self.cfg.plot_ci_bootstrap),
+                           ci_alpha=self.cfg.ci_alpha, bootstrap_seed=self.cfg.random_state)
+            log.info("[%s] phase-complete TEST slice: %d/%d rows -> JSON+figures",
+                     self.cfg.model_id, n_te, len(te_mask))
+
+        # ---- HOLDOUT slice (year holdout; rows live in self.data) ----
+        ho_mask = None
+        using_external = (self.cfg.holdout_dataset_path is not None
+                          and getattr(self, "_ext_holdout_state", None) is not None)
+        if using_external:
+            ho_mask = getattr(self, "_ext_holdout_state", {}).get("phase_complete_mask")
+        elif len(self.holdout_idx) > 0:
+            ho_mask = self._phase_complete_mask.loc[self.holdout_idx].to_numpy()
+        if ho_mask is not None and X_ho is not None and y_ho is not None \
+                and len(ho_mask) == len(y_ho) and int(ho_mask.sum()) > 0:
+            n_ho = int(ho_mask.sum())
+            Xh, yh = X_ho[ho_mask], y_ho[ho_mask]
+            m = evaluate(self.model, Xh, yh, task=self.task, classes=self.classes,
+                         n_bootstrap=self.cfg.n_bootstrap, ci_alpha=self.cfg.ci_alpha)
+            m["n_phase_complete_rows"] = n_ho
+            m["n_full_rows"] = int(len(ho_mask))
+            m["phase_blocks"] = {k: list(v) for k, v in self._phase_blocks.items()}
+            save_metrics(m, output_dir, "overall__holdout__phase_complete.json")
+            if self.cfg.generate_plots:
+                plot_slice(self.model, Xh, yh, plots_dir, self.cfg.model_id,
+                           "holdout__phase_complete",
+                           baseline_scores=_mask_baselines(baseline_scores_holdout, ho_mask),
+                           class_names=class_names,
+                           n_bootstrap=max(self.cfg.n_bootstrap, self.cfg.plot_ci_bootstrap),
+                           ci_alpha=self.cfg.ci_alpha, bootstrap_seed=self.cfg.random_state)
+            log.info("[%s] phase-complete HOLDOUT slice: %d/%d rows -> JSON+figures",
+                     self.cfg.model_id, n_ho, len(ho_mask))
 
     def _evaluate_year_holdout(
         self, output_dir: Path
@@ -1297,7 +1651,8 @@ class Trainer:
         else:
             X_ho = X_ho_raw
 
-        metrics = evaluate(self.model, X_ho, y_ho, task=self.task, classes=self.classes)
+        metrics = evaluate(self.model, X_ho, y_ho, task=self.task, classes=self.classes,
+                           n_bootstrap=self.cfg.n_bootstrap, ci_alpha=self.cfg.ci_alpha)
         metrics["n_holdout_year_rows"] = int(len(df_ho))
         save_metrics(metrics, output_dir, "overall__holdout_year.json")
         for cal_name, cal_model in self.calibrated_models.items():
@@ -1345,7 +1700,9 @@ class Trainer:
         y_ho_raw = build_target(df_ho, self.cfg.target)
         df_ho = df_ho.loc[y_ho_raw.notna()].reset_index(drop=True)
         y_ho_raw = y_ho_raw.loc[y_ho_raw.notna()].reset_index(drop=True)
-        if self.cfg.target.kind == "binary":
+        if self.cfg.target.kind in ("binary", "binary_threshold"):
+            # Both produce integer 0/1 labels (binary_threshold = score > cut),
+            # so no class-name remap is needed — cast straight to int.
             y_ho = y_ho_raw.astype(int).to_numpy()
         else:
             class_map = {v: k for k, v in self.target_inverse.items()}
@@ -1448,7 +1805,8 @@ class Trainer:
                 index=X_ho.index,
             )
 
-        metrics = evaluate(self.model, X_ho, y_ho, task=self.task, classes=self.classes)
+        metrics = evaluate(self.model, X_ho, y_ho, task=self.task, classes=self.classes,
+                           n_bootstrap=self.cfg.n_bootstrap, ci_alpha=self.cfg.ci_alpha)
         metrics["n_holdout_rows"] = int(len(df_ho))
         save_metrics(metrics, output_dir, "overall__holdout.json")
         for cal_name, cal_model in self.calibrated_models.items():
@@ -1497,6 +1855,9 @@ class Trainer:
             "raw_missingness": ext_raw_missingness,  # raw NaN pattern (cohort defs)
             "raw_baseline":    ext_raw_baseline,     # PRE-imputation snapshot (for plots)
             "imputed_baseline": baseline_input,      # IMPUTED (for cohort eval)
+            # Round 59: phase-complete mask from the PRE-imputation external
+            # frame, aligned to X_ho row order (df_ho was reset_index'd).
+            "phase_complete_mask": self._phase_complete_mask_for(df_ho).to_numpy(),
         }
 
         return X_ho, y_ho
@@ -1590,6 +1951,30 @@ class Trainer:
                 )
         except Exception as exc:
             log.info("Skipping TRISS overlay (compute_triss failed: %s)", exc)
+
+        # Round 52: RTS / MGAP / mREMS physiologic baselines, each converted
+        # to a death-risk score (higher = more likely to die) for the overlay.
+        try:
+            from .baselines import (compute_rts, compute_mgap, compute_mrems,
+                                    _RTS_MAX, _MGAP_MIN, _MGAP_MAX, _MREMS_MAX)
+            rts = compute_rts(sub).to_numpy()
+            mgap = compute_mgap(sub).to_numpy()
+            mrems = compute_mrems(sub).to_numpy()
+            phys = {
+                "RTS":   np.clip(1.0 - rts / _RTS_MAX, 0.0, 1.0),
+                "MGAP":  np.clip((_MGAP_MAX - mgap) / (_MGAP_MAX - _MGAP_MIN), 0.0, 1.0),
+                "mREMS": np.clip(mrems / _MREMS_MAX, 0.0, 1.0),
+            }
+            for nm, arr in phys.items():
+                if np.isfinite(arr).any():
+                    out[nm] = arr
+                    pct_valid = 100 * np.isfinite(arr).sum() / max(1, len(arr))
+                    log.info("[%s] %s baseline: %d/%d rows valid (%.1f%%)%s",
+                             self.cfg.model_id, nm,
+                             int(np.isfinite(arr).sum()), len(arr), pct_valid,
+                             " [external]" if use_external else "")
+        except Exception as exc:
+            log.info("Skipping RTS/MGAP/mREMS overlay (%s)", exc)
         return out
 
     def _evaluate_baselines(
@@ -1620,7 +2005,11 @@ class Trainer:
             ``baseline__<score>__<partition>.json``                    (overall)
             ``baseline__<score>__<partition>__subgroups_by_<axis>.csv`` (per axis)
         """
-        if self.task != "binary":
+        # Clinical-score baselines only make sense for the MORTALITY target.
+        # ISS_band / NISS_band targets (kind 'ordinal_bands' / 'binary_threshold')
+        # are derived from ISS/NISS, so an ISS>=16 baseline would be trivially
+        # perfect — skip baselines for them even though task=='binary'.
+        if not (self.task == "binary" and self.cfg.target.kind == "binary"):
             return
 
         if df_raw is None:
@@ -2386,14 +2775,17 @@ class Trainer:
 
         return type(model).__name__
 
-    def _emit_empty_run(self, outputs_root: Path) -> "ModelArtifact":
-        """Write NaN-filled metrics + a minimal artifact when imputer_check
-        leaves no usable predictors.
+    def _emit_empty_run(self, outputs_root: Path,
+                         reason: str = "imputer_check removed all predictors"
+                         ) -> "ModelArtifact":
+        """Write NaN-filled metrics + a minimal artifact for a combo that
+        cannot produce a model.
 
         This makes the run "complete" from the resume tracker's point of
         view (it sees overall__test.json and won't retry the combo) while
-        clearly signalling, via NaN values and a flag in config.json, that
-        the combo was abandoned due to the imputer check.
+        clearly signalling, via NaN values and a flag in config.json, the
+        ``reason`` it was abandoned (imputer_check removed all features, or
+        augmentation incompatible with imputer=none).
         """
         import json as _json
 
@@ -2404,7 +2796,7 @@ class Trainer:
             "AUROC": None, "AUPRC": None, "Brier": None,
             "balanced_accuracy": None, "f1": None,
             "recall": None, "precision": None,
-            "_skipped_reason": "imputer_check removed all predictors",
+            "_skipped_reason": reason,
         }
         for partition in ("train", "calibration", "test", "holdout"):
             (metrics_dir / f"overall__{partition}.json").write_text(
@@ -2434,12 +2826,12 @@ class Trainer:
                 "data_augmentation":     self.cfg.data_augmentation or "none",
                 "n_predictors":          0,
                 "skipped":               True,
-                "skipped_reason":        "imputer_check removed all predictors",
+                "skipped_reason":        reason,
             },
         }, indent=2))
 
-        log.info("[%s] Empty run recorded (NaN metrics + skipped flag).",
-                 self.cfg.model_id)
+        log.info("[%s] Empty run recorded (NaN metrics + skipped flag): %s",
+                 self.cfg.model_id, reason)
         # Return a lightweight artifact-less sentinel; callers only use the
         # return value for logging, so None-model is fine.
         return None

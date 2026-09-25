@@ -69,6 +69,47 @@ def _pr(y_true, y_score):
     return rec, prec, ap
 
 
+def _auc_ci(y_true, y_score, kind: str, n_boot: int, alpha: float = 0.05,
+            seed: int = 42):
+    """Stratified percentile bootstrap CI for AUROC ('roc') or AUPRC ('pr').
+
+    Returns (lo, hi) or None if n_boot<=0 or the data is degenerate.  Same
+    method as evaluation._bootstrap_cis (resample within each class), kept
+    here so the plot legends can annotate every curve — model AND baselines —
+    with its interval.
+    """
+    if not n_boot or n_boot <= 0:
+        return None
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    if len(np.unique(y_true)) < 2:
+        return None
+    metric = roc_auc_score if kind == "roc" else average_precision_score
+    rng = np.random.default_rng(seed)
+    strata = [np.where(y_true == c)[0] for c in np.unique(y_true)]
+    vals = []
+    for _ in range(int(n_boot)):
+        idx = np.concatenate([rng.choice(s, size=len(s), replace=True) for s in strata])
+        yt = y_true[idx]
+        if len(np.unique(yt)) < 2:
+            continue
+        try:
+            vals.append(float(metric(yt, y_score[idx])))
+        except ValueError:
+            continue
+    if len(vals) < max(20, n_boot // 5):
+        return None
+    arr = np.asarray(vals)
+    return (float(np.percentile(arr, 100 * alpha / 2)),
+            float(np.percentile(arr, 100 * (1 - alpha / 2))))
+
+
+def _ci_suffix(ci):
+    """Format a CI tuple as ' [lo-hi]' for legend labels (empty if None)."""
+    return "" if ci is None else f" [{ci[0]:.3f}-{ci[1]:.3f}]"
+
+
 # ---------------------------------------------------------------------------
 # Individual plot functions
 # ---------------------------------------------------------------------------
@@ -85,6 +126,9 @@ def _plot_roc_pr_one_panel(
     baseline_scores_holdout: dict[str, np.ndarray] | None,
     test_mask: np.ndarray | None = None,
     holdout_mask: np.ndarray | None = None,
+    n_bootstrap: int = 0,
+    ci_alpha: float = 0.05,
+    bootstrap_seed: int = 42,
 ) -> None:
     """Internal: render one ROC + PR figure to disk.
 
@@ -107,6 +151,9 @@ def _plot_roc_pr_one_panel(
         "ISS":   ("#2ca02c", "#98df8a"),
         "NISS":  ("#d62728", "#ff9896"),
         "TRISS": ("#9467bd", "#c5b0d5"),
+        "RTS":   ("#8c564b", "#c49c94"),
+        "MGAP":  ("#e377c2", "#f7b6d2"),
+        "MREMS": ("#17becf", "#9edae5"),
     }
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle(title_prefix, fontsize=12, fontweight="bold")
@@ -115,7 +162,7 @@ def _plot_roc_pr_one_panel(
     ax = axes[0]
     fpr, tpr, auc = _roc(y_test, score_test)
     ax.plot(fpr, tpr, lw=2.5,
-            label=f"Model (test AUC={auc:.3f}, n={test_n})",
+            label=f"Model (test AUC={auc:.3f}{_ci_suffix(_auc_ci(y_test, score_test, 'roc', n_bootstrap, ci_alpha, bootstrap_seed))}, n={test_n})",
             color="#1f77b4", zorder=10)
     ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5)
 
@@ -123,7 +170,7 @@ def _plot_roc_pr_one_panel(
             and len(np.unique(y_holdout)) > 1):
         fpr_h, tpr_h, auc_h = _roc(y_holdout, score_holdout)
         ax.plot(fpr_h, tpr_h, lw=2.5, linestyle="--",
-                label=f"Model (holdout AUC={auc_h:.3f}, n={holdout_n})",
+                label=f"Model (holdout AUC={auc_h:.3f}{_ci_suffix(_auc_ci(y_holdout, score_holdout, 'roc', n_bootstrap, ci_alpha, bootstrap_seed))}, n={holdout_n})",
                 color="#ff7f0e", zorder=9)
 
     if baseline_scores_test:
@@ -136,7 +183,7 @@ def _plot_roc_pr_one_panel(
                 fpr_b, tpr_b, auc_b = _roc(y_test[valid], scores[valid])
                 col = BASELINE_COLOURS.get(name.upper(), ("#7f7f7f", "#c7c7c7"))[0]
                 ax.plot(fpr_b, tpr_b, lw=1.5, color=col, alpha=0.85,
-                        label=f"{name} (test AUC={auc_b:.3f}, n={int(valid.sum())})")
+                        label=f"{name} (test AUC={auc_b:.3f}{_ci_suffix(_auc_ci(y_test[valid], scores[valid], 'roc', n_bootstrap, ci_alpha, bootstrap_seed))}, n={int(valid.sum())})")
             except Exception:
                 pass
 
@@ -153,7 +200,7 @@ def _plot_roc_pr_one_panel(
                 col = BASELINE_COLOURS.get(name.upper(), ("#7f7f7f", "#c7c7c7"))[1]
                 ax.plot(fpr_b, tpr_b, lw=1.5, linestyle="--",
                         color=col, alpha=0.85,
-                        label=f"{name} (holdout AUC={auc_b:.3f}, n={int(valid.sum())})")
+                        label=f"{name} (holdout AUC={auc_b:.3f}{_ci_suffix(_auc_ci(y_holdout[valid], scores[valid], 'roc', n_bootstrap, ci_alpha, bootstrap_seed))}, n={int(valid.sum())})")
             except Exception:
                 pass
 
@@ -169,7 +216,7 @@ def _plot_roc_pr_one_panel(
     ax = axes[1]
     rec, prec, ap = _pr(y_test, score_test)
     ax.plot(rec, prec, lw=2.5,
-            label=f"Model (test AP={ap:.3f}, n={test_n})",
+            label=f"Model (test AP={ap:.3f}{_ci_suffix(_auc_ci(y_test, score_test, 'pr', n_bootstrap, ci_alpha, bootstrap_seed))}, n={test_n})",
             color="#1f77b4", zorder=10)
     baseline_prev = float(np.mean(y_test))
     ax.axhline(baseline_prev, color="k", linestyle="--", lw=0.8, alpha=0.5,
@@ -179,7 +226,7 @@ def _plot_roc_pr_one_panel(
             and len(np.unique(y_holdout)) > 1):
         rec_h, prec_h, ap_h = _pr(y_holdout, score_holdout)
         ax.plot(rec_h, prec_h, lw=2.5, linestyle="--",
-                label=f"Model (holdout AP={ap_h:.3f}, n={holdout_n})",
+                label=f"Model (holdout AP={ap_h:.3f}{_ci_suffix(_auc_ci(y_holdout, score_holdout, 'pr', n_bootstrap, ci_alpha, bootstrap_seed))}, n={holdout_n})",
                 color="#ff7f0e", zorder=9)
 
     if baseline_scores_test:
@@ -192,7 +239,7 @@ def _plot_roc_pr_one_panel(
                 rec_b, prec_b, ap_b = _pr(y_test[valid], scores[valid])
                 col = BASELINE_COLOURS.get(name.upper(), ("#7f7f7f", "#c7c7c7"))[0]
                 ax.plot(rec_b, prec_b, lw=1.5, color=col, alpha=0.85,
-                        label=f"{name} (test AP={ap_b:.3f}, n={int(valid.sum())})")
+                        label=f"{name} (test AP={ap_b:.3f}{_ci_suffix(_auc_ci(y_test[valid], scores[valid], 'pr', n_bootstrap, ci_alpha, bootstrap_seed))}, n={int(valid.sum())})")
             except Exception:
                 pass
 
@@ -209,7 +256,7 @@ def _plot_roc_pr_one_panel(
                 col = BASELINE_COLOURS.get(name.upper(), ("#7f7f7f", "#c7c7c7"))[1]
                 ax.plot(rec_b, prec_b, lw=1.5, linestyle="--",
                         color=col, alpha=0.85,
-                        label=f"{name} (holdout AP={ap_b:.3f}, n={int(valid.sum())})")
+                        label=f"{name} (holdout AP={ap_b:.3f}{_ci_suffix(_auc_ci(y_holdout[valid], scores[valid], 'pr', n_bootstrap, ci_alpha, bootstrap_seed))}, n={int(valid.sum())})")
             except Exception:
                 pass
 
@@ -236,6 +283,9 @@ def plot_roc_pr(
     model_id: str,
     baseline_scores_test: dict[str, np.ndarray] | None = None,
     baseline_scores_holdout: dict[str, np.ndarray] | None = None,
+    n_bootstrap: int = 0,
+    ci_alpha: float = 0.05,
+    bootstrap_seed: int = 42,
 ) -> None:
     """ROC and PR curves — produces TWO files when baselines are supplied:
 
@@ -282,6 +332,7 @@ def plot_roc_pr(
         holdout_n=int(len(y_holdout)) if y_holdout is not None else None,
         baseline_scores_test=baseline_scores_test,
         baseline_scores_holdout=baseline_scores_holdout,
+        n_bootstrap=n_bootstrap, ci_alpha=ci_alpha, bootstrap_seed=bootstrap_seed,
     )
 
     # ── Plot 2: baseline-complete subset (all baselines computable) ──
@@ -341,6 +392,7 @@ def plot_roc_pr(
             holdout_n=int(holdout_mask.sum()) if holdout_mask is not None else None,
             baseline_scores_test=bl_test_sub,
             baseline_scores_holdout=bl_ho_sub,
+            n_bootstrap=n_bootstrap, ci_alpha=ci_alpha, bootstrap_seed=bootstrap_seed,
         )
         log.info(
             "[%s] baseline-complete plot: test n=%d/%d (%.1f%%), "
@@ -350,6 +402,51 @@ def plot_roc_pr(
             f"{int(holdout_mask.sum())}" if holdout_mask is not None else "—",
             f"{len(y_holdout)}" if y_holdout is not None else "—",
         )
+
+
+def plot_slice(
+    model,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    output_dir: Path,
+    model_id: str,
+    suffix: str,
+    baseline_scores: dict[str, np.ndarray] | None = None,
+    class_names: list[str] | None = None,
+    n_bootstrap: int = 0,
+    ci_alpha: float = 0.05,
+    bootstrap_seed: int = 42,
+) -> None:
+    """Diagnostic figures for an arbitrary row subset (e.g. the phase-complete
+    slice).  Writes ``confusion_matrix_<suffix>.png`` (all tasks) and, for
+    binary targets, ``roc_pr_curves__<suffix>.png`` (model + any baselines)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if X is None or y is None or len(y) == 0:
+        log.info("[%s] slice %s: empty subset, nothing to plot", model_id, suffix)
+        return
+    try:
+        plot_confusion_matrix(model, X, y, suffix, output_dir, model_id, class_names)
+    except Exception as exc:
+        log.warning("[%s] slice confusion (%s) failed: %s", model_id, suffix, exc)
+    if len(np.unique(y)) == 2:
+        score = _proba(model, X)
+        if score is not None:
+            try:
+                _plot_roc_pr_one_panel(
+                    score_test=score, y_test=np.asarray(y),
+                    score_holdout=None, y_holdout=None,
+                    output_path=output_dir / f"roc_pr_curves__{suffix}.png",
+                    title_prefix=f"Model: {model_id} — {suffix}",
+                    test_n=int(len(y)), holdout_n=None,
+                    baseline_scores_test=baseline_scores,
+                    baseline_scores_holdout=None,
+                    n_bootstrap=n_bootstrap, ci_alpha=ci_alpha,
+                    bootstrap_seed=bootstrap_seed,
+                )
+            except Exception as exc:
+                log.warning("[%s] slice ROC/PR (%s) failed: %s",
+                            model_id, suffix, exc)
 
 
 def plot_confusion_matrix(
@@ -502,6 +599,9 @@ def save_model_plots(
     enable_shap: bool = True,
     baseline_scores_test: dict[str, np.ndarray] | None = None,
     baseline_scores_holdout: dict[str, np.ndarray] | None = None,
+    n_bootstrap: int = 0,
+    ci_alpha: float = 0.05,
+    bootstrap_seed: int = 42,
 ) -> None:
     """Generate and save all diagnostic plots for one model.
 
@@ -520,7 +620,9 @@ def save_model_plots(
 
     plot_roc_pr(model, X_test, y_test, X_holdout, y_holdout, output_dir, model_id,
                 baseline_scores_test=baseline_scores_test,
-                baseline_scores_holdout=baseline_scores_holdout)
+                baseline_scores_holdout=baseline_scores_holdout,
+                n_bootstrap=n_bootstrap, ci_alpha=ci_alpha,
+                bootstrap_seed=bootstrap_seed)
 
     plot_confusion_matrix(model, X_test, y_test, "test", output_dir, model_id,
                           class_names=class_names)

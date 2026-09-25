@@ -40,7 +40,12 @@ echo "[INFO] Slurm job ${SLURM_JOB_ID} on $(hostname)"
 
 # Aggregate each target's outputs directory independently.  Empty
 # directories (target wasn't run) are skipped silently.
-for target_dir in outputs/mortality outputs/iss_band outputs/niss_band; do
+# Discover every target that actually has metrics, rather than hardcoding a
+# list. The band-binary targets (iss_band_binary / niss_band_binary, 2646
+# models each) were previously missed because they were added after this
+# script was written. A glob cannot go stale the same way.
+for target_dir in $(find outputs -maxdepth 2 -mindepth 2 -type d -name metrics \
+                    | sed 's:/metrics$::' | sort); do
     if [[ ! -d "${target_dir}/metrics" ]]; then
         echo "[SKIP] ${target_dir}/metrics not found — target not run."
         continue

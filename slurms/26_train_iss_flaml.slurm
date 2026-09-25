@@ -34,61 +34,62 @@ source "/scratch/${USER}/trauma_ml_venv/bin/activate"
 
 echo "[INFO] Slurm job ${SLURM_JOB_ID} on $(hostname)"
 
-trauma-train \
+# ── auto-resubmit on walltime ────────────────────────────────────────────
+# The resume tracker skips any combo that already wrote overall__test.json,
+# so re-running is cheap and lossless.  --signal delivers USR1 ~2 min before
+# the time limit; we resubmit ONCE then exit cleanly.  Normal completion or
+# scancel (SIGTERM) does NOT resubmit.
+SELF="slurms/26_train_iss_flaml.slurm"
+WALL_SECONDS=172800            # keep in sync with --time (2d)
+_resubmitted=0
+_on_timeout() {
+  if [ "${_resubmitted}" -eq 0 ]; then
+    _resubmitted=1
+    echo "[INFO] $(date) nearing walltime -> resubmitting ${SELF} to resume"
+    sbatch "${SELF}" || true
+  fi
+  exit 0
+}
+trap _on_timeout USR1
+# pure-bash watchdog: signals THIS script ~4 min before the walltime so we
+# resubmit (the resume tracker skips finished combos).  No --signal needed.
+( sleep $(( WALL_SECONDS - 240 )); kill -USR1 $$ 2>/dev/null ) &
+_watchdog=$!
+trap 'kill ${_watchdog} 2>/dev/null || true' EXIT   # stop watchdog on normal finish
+run() { "$@" & wait $!; }   # background+wait so the USR1 trap fires promptly
+
+run trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
     --targets       ISS_band \
     --inclusion-strategies "Tran NTDB" \
     --predictor-types "Tran NTDB" \
-    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
-    --imputers      median_mode mice \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" \
+    --imputers      median_mode mice bagged_trees missforest gradient_boosting \
     --model-families flaml \
     --calibrations  none \
-    --augmentations null \
-    --missingness-thresholds 25 50 85 \
+    --augmentations null smote adasyn \
+    --missingness-thresholds 10 50 \
     --use-gpu       never \
     --model-id-prefix iss_flm \
     --no-aggregate \
     --n-jobs        20 \
     --verbose
 
-# ─── Round 37: imputer_check + imputer=none in SEPARATE id-namespaces ──
-# Appended so they never renumber the existing iss_flm_* models above.
-# (a) imputer_check=True — drop features the imputer can't reconstruct
-#     on the calibration set.  Prefix iss_flm_ic.
-trauma-train \
-    --dataset       outputs/datasets/unified_train.parquet \
-    --holdout-dataset outputs/datasets/unified_holdout.parquet \
-    --targets       ISS_band \
-    --inclusion-strategies "Tran NTDB" \
-    --predictor-types "Tran NTDB" \
-    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
-    --imputers      median_mode mice \
-    --imputer-check \
-    --model-families flaml \
-    --calibrations  none \
-    --augmentations null \
-    --missingness-thresholds 25 50 85 \
-    --use-gpu       never \
-    --model-id-prefix iss_flm_ic \
-    --no-aggregate \
-    --n-jobs        20 \
-    --verbose
-
 # (b) imputer=none — flaml handles NaN natively; no imputation.
 #     imputer_check irrelevant here.  Prefix iss_flm_none.
-trauma-train \
+run trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
     --targets       ISS_band \
     --inclusion-strategies "Tran NTDB" \
     --predictor-types "Tran NTDB" \
-    --phase-cutoffs "On-scene" "On-scene + ED arrival" \
+    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" \
     --imputers      none \
     --model-families flaml \
     --calibrations  none \
     --augmentations null \
-    --missingness-thresholds 25 50 85 \
+    --missingness-thresholds 10 50 \
     --use-gpu       never \
     --model-id-prefix iss_flm_none \
     --no-aggregate \

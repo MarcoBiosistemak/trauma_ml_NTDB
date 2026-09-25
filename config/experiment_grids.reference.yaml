@@ -1,0 +1,118 @@
+# =============================================================================
+# experiment_grids.yaml — REFERENCE / TEMPLATE
+# =============================================================================
+# This is a complete, correct reference grid config.  Copy it to
+# `config/experiment_grids.yaml` (or merge the `targets:` block into your
+# existing one).  The slurms pass every axis explicitly on the command line, so
+# at runtime these values are only used as DEFAULTS when a `--flag` is omitted.
+#
+# NOTE: the ISS_band_binary / NISS_band_binary targets are ALSO built into the
+# code (trauma_ml.cli.run_experiments._BUILTIN_TARGET_DEFS), so `--targets
+# ISS_band_binary` resolves even if this file does not list them.  They are
+# included here for completeness and so they show up in the default sweep.
+
+targets:
+  - name: in_hospital_mortality
+    kind: binary
+    spec:
+      positive_code: 5          # HOSPDISCHARGEDISPOSITION == 5 = deceased
+      include_ed_death: true    # also count EDDISCHARGEDISPOSITION == 5 as positive
+
+  - name: ISS_band
+    kind: ordinal_bands
+    spec:
+      variable: ISS             # harmonised with ISS_05 fallback for AY 2019
+      bands:                    # (lower_inclusive, upper_exclusive, label)
+        - [0,   9,  minor]
+        - [9,   16, moderate]
+        - [16,  25, severe]
+        - [25,  76, profound]
+
+  - name: NISS_band
+    kind: ordinal_bands
+    spec:
+      derive_from: AISSEVERITY  # sum of squares of the 3 highest AIS severities
+      bands:
+        - [0,   9,  minor]
+        - [9,   16, moderate]
+        - [16,  25, severe]
+        - [25,  76, profound]
+
+  # Round 52: binary "severe vs not" band targets (ISS>=16 / NISS>=16).
+  # kind 'binary_threshold' reads the already-derived ISS / NISS column from
+  # the parquet and sets y = 1 when the value is strictly > threshold.
+  # IMPORTANT: use `variable: NISS` here (NOT `derive_from: AISSEVERITY`) — the
+  # binary_threshold builder reads a single numeric column directly.
+  - name: ISS_band_binary
+    kind: binary_threshold
+    spec:
+      variable: ISS
+      threshold: 15             # y = 1 when ISS  > 15  (i.e. ISS  >= 16)
+
+  - name: NISS_band_binary
+    kind: binary_threshold
+    spec:
+      variable: NISS
+      threshold: 15             # y = 1 when NISS > 15  (i.e. NISS >= 16)
+
+# -----------------------------------------------------------------------------
+# Grid axes (defaults; overridden per-run by the slurm --flags).
+# -----------------------------------------------------------------------------
+# Which registry's predictor set to use.  'all' = no registry filter.
+predictor_types:
+  - Tran NTDB
+
+# Cohort inclusion / exclusion strategy.
+inclusion_strategies:
+  - Tran NTDB
+
+# Temporal feature cutoffs.  The three time-ordered cutoffs plus a baseline-
+# input cutoff used for the clinical-score comparison runs.
+phase_cutoffs:
+  - On-scene
+  - On-scene + ED arrival
+  - On-scene + ED arrival + In-hospital
+  - all_baseline_inputs
+
+# Imputation strategies.  'none' is only used by NaN-native families
+# (xgboost / lightgbm / catboost / flaml); the grid builder skips it for the
+# rest (including doshi_ffnn, which needs an imputer).
+imputers:
+  - median_mode
+  - mice
+  - bagged_trees
+  - none
+
+# Model families (the menu).  doshi_ffnn = the Doshi-style feed-forward net.
+model_families:
+  - logistic_l1
+  - logistic_elasticnet
+  - random_forest
+  - xgboost
+  - lightgbm
+  - catboost
+  - flaml
+  - tpot
+  - tabpfn
+  - tabnet
+  - doshi_ffnn
+
+# Probability calibration.  Enabled only for BINARY targets (mortality +
+# *_band_binary); multiclass ordinal_bands targets are forced to 'none'.
+calibrations:
+  - none
+  - platt
+  - isotonic
+
+# Feature-missingness drop thresholds (percent).  A column is dropped if its
+# missing fraction exceeds the threshold.
+missingness_thresholds:
+  - 10
+  - 50
+
+# Class-imbalance augmentation.  Enabled only for BINARY targets; multiclass
+# ordinal_bands targets are forced to 'null'.  'null' = no augmentation.
+data_augmentation:
+  - null
+  - smote
+  - adasyn

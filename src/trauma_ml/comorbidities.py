@@ -54,52 +54,67 @@ CANONICAL_COMORBIDITIES = [
 # ---------------------------------------------------------------------------
 # NTDB INTEGER-CODED comorbidity lookup
 # ---------------------------------------------------------------------------
-# The PUF_PREEXISTINGCONDITION table doesn't store free-text descriptions in
-# AY 2017+ — it uses an integer code that maps to a row in the PUF data
-# dictionary's "Co-Morbid Condition" table.  The mapping is published in
-# the NTDB User Manual; the numeric→canonical map below is the merged
-# AY 2019-2024 set.  Multiple integer codes can map to the same canonical
-# (the OR of their flags is taken at merge time).
+# The PUF_PREEXISTINGCONDITIONS table (AY 2019+) stores each pre-existing
+# condition as an integer code in PREEXISTINGCONDITION with a Yes/No in
+# PREEXISTINGCONDITIONANSWER.  The integer→label format is published in the
+# "PUF Dictionary by Admission Year" workbook (PUF_PREEXISTINGCONDITIONS ▸
+# PREEXISTINGCONDITION ▸ "Response Values"/format "PREEXISTINGCONDITION.").
 #
-# Reference: ACS NTDB PUF User Manual,
-# "PUF_PREEXISTINGCONDITION" table, "PreExistingConditionCode" field.
+# VERIFIED against the official AY 2019-2024 PUF dictionaries: codes 1-38 are
+# IDENTICAL across AY 2019, 2020, 2021, 2022; AY 2024 only APPENDS 39-44 (the
+# psychiatric split).  So this single merged map is valid for all those years.
+# Empirical AY 2022 Yes-prevalences confirm each code (e.g. 19=HTN 36.5%,
+# 8=smoker 16.3%, 11=diabetes 14.3%, 23=COPD 7.0%, 9=CRF 1.7%, 25=cirrhosis
+# 1.1%, 12=disseminated cancer 0.7%).
+#
+# Multiple integer codes can map to the same canonical (OR'd at merge time);
+# this happens where NTDB (a) renamed a condition across years [old "History
+# of MI" 17 vs new "MI" 34; old "History of PVD" 18 vs new "PAD" 35; old
+# "Major Psychiatric Illness" 27 vs "Mental/Personality Disorder" 33] or
+# (b) split one umbrella into several [2024 codes 39-44 fold back into the
+# mental/personality canonical for cross-year comparability].
+#
+# Three deliberate SURROGATE foldings (set to preserve the original modelling
+# intent; flip the relevant line if a strict 1:1 mapping is preferred):
+#   * 31 Anticoagulant Therapy   -> BLEEDINGDISORDER (bleeding-risk surrogate)
+#   * 5  Current Chemotherapy    -> DISSEMINATEDCANCER (active-cancer surrogate)
+#   * 39/40/42/43/44 psych dx     -> MENTALPERSONALITYDISORDER (umbrella)
+#
+# Codes with no Tran-S1 canonical are intentionally omitted (so they're
+# skipped, not mismapped): 1 Other, 6 Congenital Anomalies, 10 CVA,
+# 16 History of Angina, 21/37 Prematurity, 24 Steroid Use, 32 Angina Pectoris,
+# 38 Pregnancy.
 NTDB_INT_TO_CANONICAL: dict[int, str] = {
-    1:  "ADVANCEDDIRECTIVELIMITINGCARE",
-    2:  "ALCOHOLUSEDISORDER",
-    # 3:  Angina Pectoris — no Tran-S1 equivalent, skipped
-    4:  "BLEEDINGDISORDER",   # Anticoagulant Therapy → bleeds risk
-    5:  "ATTENTIONDEFICITDISORDER",
-    6:  "BLEEDINGDISORDER",   # Bleeding Disorder
-    7:  "DISSEMINATEDCANCER", # Chemotherapy <30d → active cancer surrogate
-    8:  "CIRRHOSIS",
-    9:  "CHF",
-    10: "COPD",
-    11: "DISSEMINATEDCANCER", # Currently receiving chemo
-    # 12: CVA — skipped (no Tran-S1 equivalent)
-    13: "COPD",                # Currently requiring O2 → severe pulmonary
-    14: "DEMENTIA",
-    15: "DIABETESMELLITUS",
-    16: "DISSEMINATEDCANCER",
-    # 17: DVT/Thromboembolism — outcome, not pre-existing
-    18: "SUBSTANCEABUSEDISORDERDRUG",
-    19: "ESRD",
-    20: "FUNCTIONALLYDEPENDENTHEALTHSTATUS",
-    21: "MI",                  # History of MI
-    # 22: History of Angina — skipped
-    23: "HYPERTENSION",
-    24: "MENTALPERSONALITYDISORDER",  # Major Psychiatric Illness
-    25: "MENTALPERSONALITYDISORDER",
-    26: "MI",                  # Recent MI
-    # 27: Pacemaker — skipped
-    28: "PERIPHERALVASCULARDISEASE",
-    # 29: Pregnancy — skipped
-    # 30: Prematurity — skipped
-    # 31: Respirator Dependent — skipped
-    32: "SMOKINGSTATUS",       # Smoking history
-    # 33: Steroid Use — skipped
-    34: "SUBSTANCEABUSEDISORDERDRUG",
-    35: "SMOKINGSTATUS",       # Currently smoker
-    # 36-38: Other Cardiac/Pulmonary/Other Comorbidity — too vague, skipped
+    2:  "ALCOHOLUSEDISORDER",                 # Alcohol Use Disorder
+    4:  "BLEEDINGDISORDER",                   # Bleeding Disorder
+    5:  "DISSEMINATEDCANCER",                 # Currently Receiving Chemotherapy (surrogate)
+    7:  "CHF",                                # Congestive Heart Failure
+    8:  "SMOKINGSTATUS",                      # Current Smoker
+    9:  "ESRD",                               # Chronic Renal Failure
+    11: "DIABETESMELLITUS",                   # Diabetes Mellitus
+    12: "DISSEMINATEDCANCER",                 # Disseminated Cancer
+    13: "ADVANCEDDIRECTIVELIMITINGCARE",      # Advanced Directive Limiting Care
+    15: "FUNCTIONALLYDEPENDENTHEALTHSTATUS",  # Functionally Dependent Health Status
+    17: "MI",                                 # History of Myocardial Infarction (older years)
+    18: "PERIPHERALVASCULARDISEASE",          # History of Peripheral Vascular Disease (older years)
+    19: "HYPERTENSION",                       # Hypertension
+    23: "COPD",                               # Chronic Obstructive Pulmonary Disease
+    25: "CIRRHOSIS",                          # Cirrhosis
+    26: "DEMENTIA",                           # Dementia
+    27: "MENTALPERSONALITYDISORDER",          # Major Psychiatric Illness (older umbrella)
+    28: "SUBSTANCEABUSEDISORDERDRUG",         # Drug Use Disorder
+    30: "ATTENTIONDEFICITDISORDER",           # Attention Deficit Hyperactivity Disorder
+    31: "BLEEDINGDISORDER",                   # Anticoagulant Therapy (surrogate)
+    33: "MENTALPERSONALITYDISORDER",          # Mental/Personality Disorder
+    34: "MI",                                 # Myocardial Infarction
+    35: "PERIPHERALVASCULARDISEASE",          # Peripheral Arterial Disease
+    36: "SUBSTANCEABUSEDISORDERDRUG",         # Substance Abuse Disorder
+    39: "MENTALPERSONALITYDISORDER",          # Bipolar I/II Disorder       (AY2024+)
+    40: "MENTALPERSONALITYDISORDER",          # Major Depressive Disorder   (AY2024+)
+    41: "MENTALPERSONALITYDISORDER",          # Other Mental/Personality    (AY2024+)
+    42: "MENTALPERSONALITYDISORDER",          # Post-Traumatic Stress       (AY2024+)
+    43: "MENTALPERSONALITYDISORDER",          # Schizoaffective Disorder    (AY2024+)
+    44: "MENTALPERSONALITYDISORDER",          # Schizophrenia               (AY2024+)
 }
 
 
@@ -312,6 +327,51 @@ def _detect_condition_column(df: pd.DataFrame, inc_actual: str) -> tuple[str | N
     return None, "unknown"
 
 
+def _detect_answer_column(
+    df: pd.DataFrame, inc_actual: str, cond_col: str
+) -> str | None:
+    """Find the Yes/No presence column accompanying an integer condition-code
+    column in the DENSE NTDB AY2017+ PUF_PREEXISTINGCONDITION layout.
+
+    That table has one row per patient per condition *type*; whether the patient
+    actually has the condition is stored in a separate answer field (NTDB coding
+    1=Yes, 2=No), NOT in the presence of the row.  Returns the answer column
+    name, or None for older sparse / free-text formats that have no such field
+    (in which case the row's existence is taken to mean 'present', unchanged).
+
+    The ``*_BIU`` (Blank/Invalid/Unknown) companion column is explicitly skipped.
+    """
+    cols_lower = {c.lower(): c for c in df.columns}
+    skip = {inc_actual.lower(), cond_col.lower()}
+
+    # Exact, known names first.
+    for candidate in (
+        "preexistingconditionanswer", "pre_existing_condition_answer",
+        "preexistingconditionans", "conditionanswer", "comorbidanswer",
+    ):
+        col = cols_lower.get(candidate)
+        if col is not None and col.lower() not in skip \
+                and not col.lower().endswith("_biu"):
+            return col
+
+    # Heuristic: a numeric, small-valued (1/2-style) column named like an answer,
+    # never the *_BIU companion.
+    for low, actual in cols_lower.items():
+        if low in skip or low.endswith("_biu"):
+            continue
+        if any(tok in low for tok in ("answer", "present", "yesno")):
+            sample = pd.to_numeric(
+                df[actual].dropna().head(200), errors="coerce"
+            ).dropna()
+            if len(sample) and sample.min() >= 0 and sample.max() <= 9:
+                return actual
+    return None
+
+
+# NTDB PUF_PREEXISTINGCONDITION answer field: 1 = Yes (condition present).
+PRESENT_ANSWER_CODE = 1
+
+
 def extract_from_long(
     comorbidity_df: pd.DataFrame,
     inc_key_col: str = "INC_KEY",
@@ -351,8 +411,39 @@ def extract_from_long(
     log.info("extract_from_long: using inc_key=%r, condition=%r (kind=%s)",
              inc_actual, cond_col, kind)
 
-    df = comorbidity_df[[inc_actual, cond_col]].copy()
-    df.columns = [inc_key_col, "_cond"]
+    # The AY2017+ PUF_PREEXISTINGCONDITION table is DENSE (one row per patient
+    # per condition type) with a separate Yes/No answer field.  Honour it so a
+    # condition is flagged only when actually present; without this, every
+    # condition flags for every patient and the columns become constant.
+    answer_col = (
+        _detect_answer_column(comorbidity_df, inc_actual, cond_col)
+        if kind == "integer" else None
+    )
+
+    keep = [inc_actual, cond_col] + ([answer_col] if answer_col else [])
+    df = comorbidity_df[keep].copy()
+    rename = {inc_actual: inc_key_col, cond_col: "_cond"}
+    if answer_col:
+        rename[answer_col] = "_answer"
+    df = df.rename(columns=rename)
+
+    if answer_col is not None:
+        ans = pd.to_numeric(df["_answer"], errors="coerce")
+        vc = {
+            (int(k) if pd.notna(k) else "NaN"): int(v)
+            for k, v in ans.value_counts(dropna=False).items()
+        }
+        log.info(
+            "extract_from_long: presence column %r detected (NTDB 1=Yes, 2=No); "
+            "value counts %s. Keeping only answer==%d (Yes) rows.",
+            answer_col, vc, PRESENT_ANSWER_CODE,
+        )
+        before = len(df)
+        df = df[ans == PRESENT_ANSWER_CODE]
+        log.info(
+            "extract_from_long: presence filter kept %d / %d rows (Yes only).",
+            len(df), before,
+        )
 
     # Map to canonical based on detected kind
     if kind == "integer":

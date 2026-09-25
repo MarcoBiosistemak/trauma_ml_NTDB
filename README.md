@@ -1,131 +1,149 @@
 # trauma_ml
 
-ML pipeline for trauma **mortality** and **injury-severity-band** prediction on
-the National Trauma Data Bank (NTDB), admission years 2019–2024. Benchmarks
-ICD-10-based machine-learning models against the classic TRISS / ISS / NISS
-scores, following the design of Tran et al. 2022 (PLoS One,
-doi:10.1371/journal.pone.0276624).
+Machine-learning pipeline for **trauma outcome prediction** on the American
+College of Surgeons **National Trauma Data Bank (NTDB / TQP PUF)**. It builds a
+harmonised multi-year dataset from the raw NTDB CSVs and trains, calibrates,
+evaluates, and packages models for three families of outcomes, under a
+**phase-of-care** framework that mirrors when information actually becomes
+available to a clinician.
 
-## What it does
+Developed for Biosistemak / DIPC (Bilbao). Runs locally (PyCharm) or as a SLURM
+sweep on the DIPC cluster.
 
-* Builds a unified NTDB dataset across admission years, harmonising the
-  year-to-year schema changes (including case-variant column collapse, e.g.
-  `AGEYEARS` / `AGEyears` / `AgeYears` → one column).
-* Trains a large grid of models per target, varying preprocessing axes
-  (phase cutoff, imputer, calibration, augmentation, missingness threshold) so
-  every model family is compared on equal footing.
-* Computes ISS / NISS / TRISS baselines on the matching patient subset
-  (`baseline_complete`) so the "did ML beat the score?" comparison is fair.
-* Evaluates on a random test split AND an external temporal holdout (AY 2024).
+---
 
-## Targets
+## What it predicts (targets)
 
-| Target | Task | Notes |
-|---|---|---|
-| `in_hospital_mortality` | binary | primary outcome; ISS/NISS/TRISS baselines apply |
-| `ISS_band` | multiclass | injury-severity band; multiclass-only grid restrictions |
-| `NISS_band` | multiclass | new ISS band; same restrictions |
+| Target | Kind | Task | Definition |
+|---|---|---|---|
+| `in_hospital_mortality` | binary | binary | death (disposition incl. ED death) |
+| `ISS_band` | ordinal bands | 4-class | Injury Severity Score 0–9 / 9–16 / 16–25 / 25–75 |
+| `NISS_band` | ordinal bands | 4-class | New ISS, same band cuts |
+| `ISS_band_binary` | binary threshold | binary | severe injury, `ISS ≥ 16` |
+| `NISS_band_binary` | binary threshold | binary | severe injury, `NISS ≥ 16` |
 
-## Model families
+Survival families (`cox_ph`, `deep_surv`, `random_survival_forest`) are also
+supported for time-to-event framings.
 
-xgboost, lightgbm, catboost, random_forest, logistic (L1 + elastic net),
-flaml (AutoML), tpot (AutoML), tabnet, tabpfn. Survival models (cox_ph,
-random_survival_forest) are scaffolded but not currently run — NTDB lacks a
-clean time-to-death.
+## Phase-of-care framework
 
-## Install
+Predictors are grouped by **when they become known**, so a model can be trained
+for the exact decision point it will be used at:
 
-```bash
-pip install -e .                 # core
-pip install -e ".[boosting]"     # + xgboost, lightgbm, catboost
-pip install -e ".[automl]"       # + flaml
-pip install -e ".[full]"         # + tabpfn, pytorch-tabnet, torch
-pip install -e ".[all]"          # everything
-```
+1. **On-scene / first contact** (L1, 32 features) — demographics, payer,
+   anthropometry, mechanism/intent, on-scene GCS/SBP/RR, prehospital arrest,
+   transport mode, 18 comorbidities.
+2. **+ At ED arrival** (L2, +7 → 39) — ED vitals (temperature, SpO₂, pulse),
+   arrival interval, pupillary response, alcohol screen.
+3. **+ In-hospital** (L3) — injury coding: 22 Barell/specific-injury features,
+   plus `ISS`/`NISS` for the mortality target (excluded for band targets, where
+   they define the label).
 
-Requires Python ≥ 3.10.
+`EDDISCHARGEHRS` is **blacklisted** as leakage; insurance/payer is kept as an
+admission-time feature and as a fairness subgroup axis. See
+`NTDB_REQUIRED_COLUMNS.md` for the full column list and provenance.
 
-## CLI entry points
-
-| Command | Purpose |
-|---|---|
-| `trauma-build` | build the unified train + holdout parquet from raw NTDB |
-| `trauma-train` | run the experiment grid (one or more families) |
-| `trauma-predict` | score new data with a saved model bundle |
-| `trauma-aggregate` | walk `outputs/` and write `all_metrics.csv` |
-
-## Imputation strategy (rounds 35–37)
-
-Imputers performed poorly on NTDB, so the pipeline supports three regimes,
-selectable per run:
-
-| `--imputers` | `--imputer-check` | Behaviour |
-|---|---|---|
-| `median_mode` / `mice` | (absent) | impute everything (original behaviour) |
-| `median_mode` / `mice` | present | impute, then **drop features the imputer can't reconstruct** on the calibration set (numeric MAE/std < 0.5, categorical accuracy > 0.7). If no feature survives, metrics are emitted as NaN. |
-| `none` | n/a | **no imputation** — model consumes NaN directly. Only valid for NaN-native families: xgboost, lightgbm, catboost, flaml. |
-
-Imputer quality is always evaluated on the **calibration set**, never the test
-set, so the test split stays pristine for final evaluation. Per-feature
-reconstruction quality (with a `keep` flag) is written to
-`outputs/<target>/imputation_eval/<model_id>/imputation_eval_<method>.csv`.
-
-## Output layout
+## Pipeline
 
 ```
-outputs/
-├── datasets/
-│   ├── unified_train.parquet      AY 2019-2022, ~4.67M rows
-│   └── unified_holdout.parquet    AY 2024, ~1.15M rows
-└── <target>/                      mortality / iss_band / niss_band
-    ├── models/<model_id>/
-    │   ├── config.json            full run configuration (incl. imputer_check)
-    │   └── artifact.pkl           pickled ModelArtifact (the fitted bundle)
-    ├── metrics/<model_id>/
-    │   └── overall__<partition>[__<subset>].json
-    ├── plots/<model_id>/          ROC/PR, calibration, confusion matrices, SHAP
-    ├── imputation_eval/<model_id>/
-    ├── all_metrics.csv            (after trauma-aggregate)
-    └── baseline_metrics.csv       ISS / NISS / TRISS
+raw NTDB CSVs ──trauma-build──▶ unified_train.parquet + unified_holdout.parquet
+                                         │
+                                   trauma-train
+   per (target × phase × model × imputer × calibration × augmentation × missingness):
+     load+filter → build target → select predictors → temporal split
+     → pre-filter (NZV + correlated/duplicate drop)
+     → encode/scale → impute (+optional imputer-check) → augment (SMOTE/ADASYN)
+     → fit model → calibrate (binary) → evaluate → save ModelArtifact
 ```
 
-`config.json` keys: `model_id, family, actual_model_type, task, target_spec,
-predictor_cols, numeric_cols, categorical_cols, target_inverse, config{…},
-extras`. The nested `config` block holds `phase_cutoff, imputer_method,
-imputer_check, calibration, data_augmentation, missingness_threshold,
-model_family`. Metric columns follow `<metric>__<partition>[__<subset>]`, e.g.
-`AUROC__random_test`, `AUPRC__holdout_external__baseline_complete`.
+Each run emits metric JSONs (train / calibration / test / temporal-holdout),
+subgroup CSVs, diagnostic figures, and a self-contained deployable artifact.
 
-## Running on the DIPC cluster
+The runner caches preprocessing across combos: encoders+imputer are fit once per
+`(target, predictor_type, phase, inclusion, missingness, imputer, family)` group and
+reused across all calibration+augmentation variants, and for binary targets the base
+model is trained once per augmentation and reused across `none/platt/isotonic`
+(only the post-hoc calibrator differs). This makes slow imputers ~9× cheaper and
+binary training ~3× cheaper while producing **byte-identical** outputs to a
+per-combo fit; disable with `--no-prep-cache`.
 
-See [`slurms/README.md`](slurms/README.md) for the full slurm catalogue,
-resource sizing, the round-37 multi-invocation layout, and the standard
-deploy/resubmit cycle.
+### Model families
+Gradient boosting (`xgboost`, `lightgbm`, `catboost`), `flaml`, `tpot`,
+`random_forest`, `logistic_l1`, `logistic_elasticnet`, deep tabular (`tabnet`,
+`ft_transformer`, `tabpfn`), and feed-forward nets: `doshi_ffnn` (tabular) plus the faithful **`doshi_ffnn_icd`** / **`doshi_ffnn_icd_plus`** that vectorise the patient's ICD-10 code list to a multi-hot (Doshi 2024 ICD→severity, L3-only).
+Boosting families consume NaN natively; the rest require an imputer.
 
-## Source layout
+### Imputation
+`median_mode`, `mice`, `bagged_trees` (MissForest-style bagged trees),
+`missforest`, `gradient_boosting` (HistGradientBoosting MICE), or `none`
+(NaN-native models). Optional **imputer-check** masks
+known cells and keeps only features the imputer reconstructs well (relative MAE
+for numeric, balanced accuracy ≥ 0.6 for categorical).
+
+### Feature selection
+Embedded per family: L1 (logistic), tree regularisation (boosting/RF), attentive
+masks (tabnet), L1 on the first layer (`doshi_ffnn`). A model-agnostic
+**pre-filter** (near-zero-variance + near-perfectly-correlated/duplicate drop,
+each removal logged) runs for every family and target.
+
+### Clinical baselines
+For mortality, **TRISS, RTS, MGAP, mREMS** are computed and overlaid on the
+ROC/PR curves and reported as metrics, so model gains over standard scores are
+explicit.
+
+### Evaluation
+Per target and partition: AUROC/AUPRC (binary) or balanced accuracy + per-class
+recall (multiclass), Brier, calibration, confusion matrices, and SHAP. Three
+row-slices — **full**, **baseline_complete** (all clinical baselines computable),
+and **phase_complete** (≥1 real value per phase block) — each with their own
+metric JSON and figures. Bootstrap confidence intervals are written to the JSONs
+(`--bootstrap-ci`) and annotated on the binary ROC/PR legends by default.
+Subgroup metrics are produced for gender, age, admission year, ethnicity, race,
+mechanism, intent, and insurance.
+
+### Deployment
+Models are saved as a `ModelArtifact` bundling **encoders → scalers → imputer →
+model → calibration**; `ModelArtifact.predict` applies the whole chain to raw
+input, so serving (the FastAPI app in `app/`, or a Hugging Face Space) loads the
+artifact rather than a bare estimator. `doshi_ffnn` needs `torch` in the image.
+
+## Repository layout
 
 ```
 src/trauma_ml/
-├── ntdb_loader.py    raw NTDB → unified parquet (schema harmonisation, dedup)
-├── catalogue.py      variable catalogue + alias resolution
-├── inclusion.py      cohort inclusion strategies
-├── targets.py        target construction (mortality, ISS_band, NISS_band)
-├── barell.py         Barell ICD-10 injury matrix features
-├── comorbidities.py  canonical comorbidity flags
-├── baselines.py      ISS / NISS / TRISS computation
-├── splitting.py      train / calibration / test split (year-stratified)
-├── imputation.py     imputers + imputation evaluation + feature gating
-├── models.py         model factories (one per family)
-├── trainer.py        the per-run orchestrator (TrainerConfig, run())
-├── evaluation.py     metric computation per partition / subset
-├── plots.py          ROC/PR, calibration, confusion, SHAP figures
-├── persistence.py    ModelArtifact save/load
-├── cli/              command-line entry points
-└── app/              FastAPI serving scaffold
+  cli/            trauma-build, trauma-train, trauma-aggregate entry points
+  ntdb_loader.py  per-year load, alias harmonisation, whitelist, derivations
+  catalogue.py    single source of truth for phases / predictors / blacklist
+  barell.py       Barell injury-matrix features
+  targets.py      target construction (binary / ordinal_bands / binary_threshold)
+  baselines.py    TRISS / RTS / MGAP / mREMS
+  imputation.py   imputers + imputer-check (balanced-accuracy gate)
+  models.py       model factories (incl. doshi_ffnn)
+  trainer.py      orchestration: split, pre-filter, fit, calibrate, evaluate, slices
+  evaluation.py   metrics + bootstrap CIs
+  plots.py        ROC/PR, confusion, calibration, SHAP, slice figures
+  persistence.py  ModelArtifact (deployable pipeline bundle)
+  app/            FastAPI service + Dockerfile
+slurms/           cluster jobs: 00 build, 10–34 train, 99 aggregate
+config/           paths.yaml + experiment grids
+analysis_figures.py   post-hoc paper-quality figures + stats across all targets
+DIPC_RUNBOOK.md       operational guide (build → train → analyse → deploy)
+PIPELINE_OPTIONS.md   every option/axis explained
+NTDB_REQUIRED_COLUMNS.md   columns consumed + provenance
 ```
 
-## Reference
+## Quick start
 
-Tran Z, et al. *Machine learning models outperform the Trauma and Injury
-Severity Score (TRISS) in predicting mortality after trauma.* PLoS One 2022.
-doi:10.1371/journal.pone.0276624
+```bash
+pip install -e .                    # + pip install torch for DL families
+trauma-build --years 2019 2020 2021 2022 2024 --holdout-years 2024 --anonymize --verbose
+trauma-train --dataset unified_train.parquet --holdout-dataset unified_holdout.parquet \
+  --targets in_hospital_mortality --model-families xgboost \
+  --phase-cutoffs "On-scene + ED arrival + In-hospital" \
+  --imputers median_mode --calibrations isotonic --missingness-thresholds 50 --verbose
+python analysis_figures.py          # from the outputs/ folder, after a sweep
+```
+
+On the cluster, submit `slurms/00_build_dataset.slurm`, then the `1x/2x/3x`
+training jobs, then `slurms/99_aggregate.slurm`. See **DIPC_RUNBOOK.md** for the
+full procedure and **PIPELINE_OPTIONS.md** for every configurable axis.

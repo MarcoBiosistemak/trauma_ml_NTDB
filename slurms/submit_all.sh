@@ -46,26 +46,76 @@ fi
 # Comment out any line you don't want to run on this submission.
 TRAIN_JOBS=(
   # ── Mortality (binary) ──────────────────────────────────────────────
-  "slurms/10_train_logistic.slurm"        # CPU,  prefix lgr_*  (~1 h)
-  "slurms/11_train_lightgbm.slurm"        # GPU,  prefix lgb_*  (~12-24 h)
-  "slurms/12_train_xgboost.slurm"         # GPU,  prefix xgb_*  (~12-24 h)
-  "slurms/13_train_catboost.slurm"        # GPU,  prefix cb_*   (~12-24 h)
-  "slurms/14_train_flaml.slurm"           # CPU,  prefix flm_*  (AutoML, ~24-48 h)
-  "slurms/15_train_tpot.slurm"            # CPU,  prefix tpt_*  (AutoML, ~48-72 h)
-  "slurms/16_train_random_forest.slurm"   # CPU,  prefix rf_*   (~24-48 h)
-  "slurms/17_train_tabpfn.slurm"          # GPU,  prefix tpf_*  (sub-sampled, ~1 h)
-  "slurms/18_train_tabnet.slurm"          # GPU,  prefix tnt_*  (~12-24 h)
-  # "slurms/19_train_survival.slurm"      # DISABLED: survival target builder
-                                            #   raises NotImplementedError.
-  # ── ISS-band (multiclass) ───────────────────────────────────────────
-  "slurms/20_train_iss_xgboost.slurm"        # GPU,  prefix iss_xgb_*
-  "slurms/21_train_iss_lightgbm.slurm"       # GPU,  prefix iss_lgb_*
-  "slurms/22_train_iss_random_forest.slurm"  # CPU,  prefix iss_rf_*
-  # ── NISS-band (multiclass) ──────────────────────────────────────────
-  "slurms/23_train_niss_xgboost.slurm"       # GPU,  prefix niss_xgb_*
-  "slurms/24_train_niss_lightgbm.slurm"      # GPU,  prefix niss_lgb_*
-  "slurms/25_train_niss_random_forest.slurm" # CPU,  prefix niss_rf_*
+  "slurms/10_train_logistic.slurm"        # CPU,  prefix lgr_*
+  "slurms/11_train_lightgbm.slurm"        # CPU,  prefix lgb_*
+  "slurms/12_train_xgboost.slurm"         # CPU,  prefix xgb_*
+  "slurms/13_train_catboost.slurm"        # CPU,  prefix cb_*
+  "slurms/14_train_flaml.slurm"           # CPU,  prefix flm_*  (AutoML)
+  "slurms/15_train_tpot.slurm"            # CPU,  prefix tpt_*  (AutoML, big-mem)
+  "slurms/16_train_random_forest.slurm"   # CPU,  prefix rf_*   (big-mem)
+  "slurms/17_train_tabpfn.slurm"          # GPU rtx3090, prefix tpf_*
+  "slurms/18_train_tabnet.slurm"          # GPU rtx3090, prefix tnt_*  (main grid)
+  "slurms/18a_train_tabnet.slurm"         # GPU rtx3090, tabnet slice a
+  "slurms/18b_train_tabnet.slurm"         # GPU rtx3090, tabnet slice b
+  "slurms/18c_train_tabnet.slurm"         # GPU rtx3090, tabnet slice c
+  "slurms/18d_train_tabnet.slurm"         # GPU rtx3090, tabnet slice d
+  "slurms/18e_train_tabnet.slurm"         # GPU rtx3090, tabnet slice e
+  "slurms/18f_train_tabnet.slurm"         # GPU rtx3090, tabnet slice f
+  "slurms/18g_train_tabnet.slurm"         # GPU rtx3090, tabnet slice g
+  "slurms/18h_train_tabnet.slurm"         # GPU rtx3090, tabnet slice h
+  "slurms/30_train_mortality_doshi_ffnn.slurm"  # GPU rtx3090, prefix doshi_*
+  # ── ISS-band (4-class ordinal) ──────────────────────────────────────
+  "slurms/20_train_iss_xgboost.slurm"        # CPU,  prefix iss_xgb_*
+  "slurms/21_train_iss_lightgbm.slurm"       # CPU,  prefix iss_lgb_*
+  "slurms/22_train_iss_random_forest.slurm"  # CPU,  prefix iss_rf_*  (big-mem)
+  "slurms/26_train_iss_flaml.slurm"          # CPU,  prefix iss_flm_*
+  "slurms/27_train_iss_tpot.slurm"           # CPU,  prefix iss_tpt_*  (big-mem)
+  "slurms/33_train_iss_doshi_ffnn.slurm"     # GPU rtx3090, prefix iss_doshi_*
+  # ── NISS-band (4-class ordinal) ─────────────────────────────────────
+  "slurms/23_train_niss_xgboost.slurm"       # CPU,  prefix niss_xgb_*
+  "slurms/24_train_niss_lightgbm.slurm"      # CPU,  prefix niss_lgb_*
+  "slurms/25_train_niss_random_forest.slurm" # CPU,  prefix niss_rf_*  (big-mem)
+  "slurms/28_train_niss_flaml.slurm"         # CPU,  prefix niss_flm_*
+  "slurms/29_train_niss_tpot.slurm"          # CPU,  prefix niss_tpt_*  (big-mem)
+  "slurms/34_train_niss_doshi_ffnn.slurm"    # GPU rtx3090, prefix niss_doshi_*
+  # ── Band-binary (ISS>=16 / NISS>=16) ────────────────────────────────
+  # Split into 6 parallel slices per block (--start-id/--end-id over the SAME
+  # full grid, so model_ids stay canonical and partial work is preserved).
+  # The old monolithic 31_/32_ slurms are superseded by these and are NOT
+  # submitted; they ran both blocks sequentially, so the `_other` block
+  # (1350 combos) never started until `_boost` (1296) fully finished.
+  #   *_bin_boost : xgboost/lightgbm/catboost/flaml (+imputer=none), 1296 combos
+  #   *_bin_other : logistic_l1/elasticnet/random_forest/tpot/tabnet, 1350 combos
+  "slurms/31a_train_iss_bin_boost.slurm"     # iss_bin_boost_0000..0215
+  "slurms/31b_train_iss_bin_boost.slurm"     # iss_bin_boost_0216..0431
+  "slurms/31c_train_iss_bin_boost.slurm"     # iss_bin_boost_0432..0647
+  "slurms/31d_train_iss_bin_boost.slurm"     # iss_bin_boost_0648..0863
+  "slurms/31e_train_iss_bin_boost.slurm"     # iss_bin_boost_0864..1079
+  "slurms/31f_train_iss_bin_boost.slurm"     # iss_bin_boost_1080..1295
+  "slurms/31g_train_iss_bin_other.slurm"     # iss_bin_other_0000..0224
+  "slurms/31h_train_iss_bin_other.slurm"     # iss_bin_other_0225..0449
+  "slurms/31i_train_iss_bin_other.slurm"     # iss_bin_other_0450..0674
+  "slurms/31j_train_iss_bin_other.slurm"     # iss_bin_other_0675..0899
+  "slurms/31k_train_iss_bin_other.slurm"     # iss_bin_other_0900..1124
+  "slurms/31l_train_iss_bin_other.slurm"     # iss_bin_other_1125..1349
+  "slurms/32a_train_niss_bin_boost.slurm"    # niss_bin_boost_0000..0215
+  "slurms/32b_train_niss_bin_boost.slurm"    # niss_bin_boost_0216..0431
+  "slurms/32c_train_niss_bin_boost.slurm"    # niss_bin_boost_0432..0647
+  "slurms/32d_train_niss_bin_boost.slurm"    # niss_bin_boost_0648..0863
+  "slurms/32e_train_niss_bin_boost.slurm"    # niss_bin_boost_0864..1079
+  "slurms/32f_train_niss_bin_boost.slurm"    # niss_bin_boost_1080..1295
+  "slurms/32g_train_niss_bin_other.slurm"    # niss_bin_other_0000..0224
+  "slurms/32h_train_niss_bin_other.slurm"    # niss_bin_other_0225..0449
+  "slurms/32i_train_niss_bin_other.slurm"    # niss_bin_other_0450..0674
+  "slurms/32j_train_niss_bin_other.slurm"    # niss_bin_other_0675..0899
+  "slurms/32k_train_niss_bin_other.slurm"    # niss_bin_other_0900..1124
+  "slurms/32l_train_niss_bin_other.slurm"    # niss_bin_other_1125..1349
+  # ── Faithful Doshi ICD->severity FFNN (L3-only) ─────────────────────
+  "slurms/35_train_doshi_icd.slurm"          # GPU rtx3090, prefix doshi_icd*/doshi_icdplus*
+  # ── Survival (optional; enable if the survival target builder is ready)
+  # "slurms/19_train_survival.slurm"         # CPU, big-mem
 )
+
 
 TRAIN_IDS=()
 for slurm_file in "${TRAIN_JOBS[@]}"; do

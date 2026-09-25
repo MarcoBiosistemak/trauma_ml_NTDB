@@ -491,18 +491,30 @@ def apply_whitelist(
         "GCSTOTAL", "SBPFIRST", "RRFIRST",
         # TRISS covariates
         "AGEYEARS", "TRAUMATYPE",
-        # Demographics for subgroup analysis + Tran S1 Table
-        "SEX", "ETHNICITY", "RACE", "PRIMARYINSURANCE",
+        # Demographics for subgroup analysis + Tran S1 Table.
+        # There is no single native RACE column (NTDB ships RACE_* category
+        # flags).  PRIMARYMETHODPAYMENT (insurance/payer) is kept as an
+        # admission-time economic feature + sociodemographic subgroup axis.
+        "SEX", "ETHNICITY", "PRIMARYMETHODPAYMENT",
+        # Anthropometry (L1), all NTDB years
+        "HEIGHT", "WEIGHT",
+        # Raw ICD-10 diagnosis code list (faithful Doshi FFNN input; L3).
+        "ICD_DIAG_CODES",
         # Mechanism / intent (from ECODE join)
         "MECHANISM", "INTENT",
-        # ED-arrival vitals (round 26 — Tran "highest 24-hour" feature group)
-        "EDSBP", "EDPULSERATE", "EDTEMPERATURE",
-        "EDRESPIRATORYRATE", "EDOXYGENSATURATION", "EDGCSTOTAL",
-        # 24-hour highest/lowest vitals (Tran 2022 base XGBoost features)
-        "SBPHIGHEST", "RRHIGHEST", "GCSHIGHEST",
-        "SBPLOWEST", "RRLOWEST", "GCSLOWEST",
-        # First-recorded vitals beyond TRISS
+        # First-recorded vitals beyond TRISS (these ARE the ED-arrival values;
+        # NTDB has no separate "ED*"-prefixed or "*HIGHEST/*LOWEST" columns,
+        # so those placeholders were removed in round 51).
         "TEMPERATURE", "PULSEOXIMETRY", "PULSERATE",
+        # Round 51: new predictors (all native, all NTDB years 2019-2024)
+        # L1 (on-scene): transport mode, prehospital cardiac arrest
+        "TRANSPORTMODE", "PREHOSPITALCARDIACARREST",
+        # L2 (ED arrival): incident->arrival time, pupils, alcohol screen
+        # (NTDB has NO drug-screen field — only alcohol)
+        "HOSPITALARRIVALHRS", "TBIPUPILLARYRESPONSE",
+        "ALCOHOLSCREEN", "ALCOHOLSCREENRESULT",
+        # (EDDISCHARGEHRS removed in round 56 — leakage; see catalogue
+        #  NON_PREDICTOR_COLUMNS)
         # Comorbidities — Tran 2022 S1 Table (round 26)
         "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
         "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
@@ -636,12 +648,20 @@ def load_year(
     aisdiag = _read_csv_safe(year_dir / ntdb_tables["aisdiagnosis"])
     trauma = derive_niss(trauma, aisdiag, inc_key_col=inc_key_col)
 
-    # Round 27: Barell-style injury features from ICD-10-CM diagnosis codes.
-    # Reuses the AISDIAGNOSIS table already loaded for NISS — adds 22 binary
-    # injury columns (12 body regions + 10 Tran-flagged specific injuries).
-    # See trauma_ml.barell for the mapping rules.
-    from .barell import merge_barell_features
-    trauma = merge_barell_features(trauma, aisdiag, inc_key_col=inc_key_col)
+    # Round 50 FIX: Barell-style injury features must come from the
+    # ICD-10-CM diagnosis table (PUF_ICDDIAGNOSIS), NOT PUF_AISDIAGNOSIS.
+    # PUF_AISDIAGNOSIS carries AIS predot codes (AISPreDot, e.g. 140202),
+    # which are an entirely different coding system from ICD-10-CM.  Feeding
+    # it to compute_barell_features (which matches ICD-10-CM S/T prefixes)
+    # produced all-zero Barell columns for every patient.  The ICD-10-CM
+    # codes live in PUF_ICDDIAGNOSIS (ICDDIAGNOSISCODE, e.g. S06.5X9A).
+    # NISS still uses aisdiag above — that table genuinely holds AIS severities.
+    icddiag = _read_csv_safe(year_dir / ntdb_tables["icddiagnosis"])
+    from .barell import merge_barell_features, merge_icd_code_list
+    trauma = merge_barell_features(trauma, icddiag, inc_key_col=inc_key_col)
+    # Faithful Doshi FFNN input: per-patient raw ICD-10 code list (one compact
+    # string column; the doshi_ffnn model vectorises it to a multi-hot itself).
+    trauma = merge_icd_code_list(trauma, icddiag, inc_key_col=inc_key_col)
 
     # Round 29: comorbidity features (Tran 2022 S1 Table set, 18 binary
     # flags).  NTDB stores these differently per year — sometimes as wide
@@ -672,6 +692,38 @@ def load_year(
 # ---------------------------------------------------------------------------
 # Unified builder
 # ---------------------------------------------------------------------------
+def warn_missing_predictors(
+    df: pd.DataFrame,
+    year: int,
+    expected_cols: Iterable[str],
+) -> list[str]:
+    """Round 51: log a WARNING for every expected predictor column that is
+    NOT present in this admission year's frame (checked AFTER load_year, so
+    derived columns — NISS, BARELL_*/INJ_*, aliased ISS/GCSTOTAL/… — are
+    already in place).
+
+    This is a diagnostic, not a hard failure: a column may be legitimately
+    absent in some years (e.g. NTDB dropped EMS physiology after 2020), and
+    seeing the warning tells you whether to adjust the catalogue / phase
+    lists or accept the per-year missingness.  Returns the missing list.
+    """
+    present_lower = {c.lower() for c in df.columns}
+    missing = sorted({c for c in expected_cols if c.lower() not in present_lower})
+    if missing:
+        log.warning(
+            "AY %d availability check: %d expected predictor column(s) MISSING "
+            "after load — %s. (If a column should exist, check the NTDB CSV / "
+            "alias map; if it is legitimately year-specific, this is expected.)",
+            year, len(missing), missing,
+        )
+    else:
+        log.info(
+            "AY %d availability check: all %d expected predictor columns present.",
+            year, len(list(expected_cols)),
+        )
+    return missing
+
+
 def build_unified_dataset(
     catalogue: Catalogue,
     ntdb_root: Path,
@@ -704,6 +756,19 @@ def build_unified_dataset(
     """
     years_list = list(years) if years is not None else sorted(ntdb_year_subdirs.keys())
 
+    # Round 51: the full predictor union we expect to be available, used to
+    # warn (per year) about any column that did not materialise after load.
+    try:
+        expected_predictors = catalogue.variables_for(
+            phase_cutoff="On-scene + ED arrival + In-hospital",
+            include_target_derivers=False,
+            include_injury_features=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — never let the diagnostic break a build
+        log.warning("Could not compute expected-predictor list for availability "
+                    "check: %s", exc)
+        expected_predictors = []
+
     frames: list[pd.DataFrame] = []
     for year in years_list:
         subdir = ntdb_year_subdirs.get(year)
@@ -715,6 +780,8 @@ def build_unified_dataset(
         if df_year is None:
             log.warning("No data for AY %d", year)
             continue
+        if expected_predictors:
+            warn_missing_predictors(df_year, year, expected_predictors)
         frames.append(df_year)
 
     if not frames:

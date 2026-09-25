@@ -517,6 +517,21 @@ class _TPOTWrapper:
 # Foundation model — TabPFN (+ TabPFN 2.5 alias)
 # ---------------------------------------------------------------------------
 def tabpfn(task: str, n_jobs: int = 4, use_gpu: str = "auto", **kwargs) -> Any:
+    """Build a TabPFN classifier that works across TabPFN versions.
+
+    TabPFN's constructor changed between major versions: v1 took
+    ``N_ensemble_configurations``, while v2+ (incl. 2.5 / 8.x) renamed it to
+    ``n_estimators`` and added ``ignore_pretraining_limits``.  Passing a
+    parameter the installed version doesn't know raises TypeError, so instead
+    of hard-coding names we introspect the signature and pass only what is
+    actually supported.
+
+    TabPFN is also a *small-data* foundation model (pretraining limit ~10k
+    rows).  Trauma cohorts are far larger, so the returned estimator is
+    wrapped in an adapter that stratified-subsamples the training set down to
+    ``tabpfn_max_train`` rows (default 10000) before fitting.  This keeps the
+    family runnable and comparable; report the subsample size in the paper.
+    """
     try:
         from tabpfn import TabPFNClassifier
     except ImportError:
@@ -524,12 +539,98 @@ def tabpfn(task: str, n_jobs: int = 4, use_gpu: str = "auto", **kwargs) -> Any:
     if task != "binary":
         log.warning("TabPFN works best in binary settings; multiclass supported up to 10 classes")
     device = _resolve_device(use_gpu)
-    log.info("tabpfn factory: device=%s", device)
-    # TabPFN expects N <= 10k for v2.x; caller is responsible for subsampling
-    return TabPFNClassifier(
-        device=kwargs.get("device", device),
-        N_ensemble_configurations=kwargs.get("ensembles", 32),
-    )
+
+    import inspect
+    try:
+        supported = set(
+            inspect.signature(TabPFNClassifier.__init__).parameters
+        ) - {"self", "args", "kwargs"}
+    except (TypeError, ValueError):       # pragma: no cover - exotic builds
+        supported = set()
+
+    ensembles = kwargs.get("ensembles", 32)
+    # Candidate params, newest-first names; only supported ones are passed.
+    candidates = {
+        "device": kwargs.get("device", device),
+        "n_estimators": ensembles,                 # TabPFN v2+
+        "N_ensemble_configurations": ensembles,    # TabPFN v1
+        "ignore_pretraining_limits": True,         # v2+: allow >10k rows
+        "random_state": kwargs.get("random_state", 42),
+        "n_jobs": n_jobs,
+    }
+    init_kwargs = {k: v for k, v in candidates.items() if k in supported}
+    # Don't send both spellings of the ensemble-size parameter.
+    if "n_estimators" in init_kwargs:
+        init_kwargs.pop("N_ensemble_configurations", None)
+
+    log.info("tabpfn factory: device=%s, init kwargs=%s",
+             device, sorted(init_kwargs))
+    clf = TabPFNClassifier(**init_kwargs)
+
+    max_train = int(kwargs.get("tabpfn_max_train", 10000))
+    return _TabPFNSubsampleAdapter(clf, max_train=max_train,
+                                   random_state=kwargs.get("random_state", 42))
+
+
+class _TabPFNSubsampleAdapter:
+    """Cap TabPFN's training-set size (stratified) before delegating to it.
+
+    TabPFN performs in-context inference and degrades / OOMs well before the
+    millions of rows in NTDB.  We keep the full pipeline intact (imputation,
+    augmentation, calibration all happen upstream) and only shrink what is
+    handed to ``fit``.  Prediction is unaffected.
+    """
+
+    def __init__(self, estimator, max_train: int = 10000, random_state: int = 42):
+        self.estimator = estimator
+        self.max_train = max_train
+        self.random_state = random_state
+
+    # sklearn-compat plumbing -------------------------------------------------
+    def get_params(self, deep: bool = True) -> dict:
+        return {"estimator": self.estimator, "max_train": self.max_train,
+                "random_state": self.random_state}
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+    @property
+    def classes_(self):
+        return self.estimator.classes_
+
+    def __getattr__(self, item):
+        # Delegate anything we don't define (e.g. fitted attributes).
+        return getattr(self.__dict__["estimator"], item)
+
+    # core API ---------------------------------------------------------------
+    def fit(self, X, y, **fit_kwargs):
+        import numpy as np
+        n = len(y)
+        if self.max_train and n > self.max_train:
+            try:
+                from sklearn.model_selection import train_test_split
+                idx = np.arange(n)
+                keep, _ = train_test_split(
+                    idx, train_size=self.max_train,
+                    random_state=self.random_state, stratify=y,
+                )
+            except Exception:                     # tiny/degenerate classes
+                rng = np.random.default_rng(self.random_state)
+                keep = rng.choice(n, size=self.max_train, replace=False)
+            X = X.iloc[keep] if hasattr(X, "iloc") else X[keep]
+            y = y.iloc[keep] if hasattr(y, "iloc") else y[keep]
+            log.info("TabPFN: subsampled training set %d -> %d rows "
+                     "(stratified, seed=%d)", n, len(y), self.random_state)
+        self.estimator.fit(X, y, **fit_kwargs)
+        return self
+
+    def predict(self, X):
+        return self.estimator.predict(X)
+
+    def predict_proba(self, X):
+        return self.estimator.predict_proba(X)
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +806,277 @@ def deep_surv(task: str, **kwargs) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Doshi-style feed-forward neural network (Round 52)
+# ---------------------------------------------------------------------------
+# Doshi et al. (2024) used a feed-forward network to map injury codes to ISS
+# (ISS>=16 binary or exact ISS).  They did not publish a full architecture, so
+# this is a faithful, reasonable reconstruction: a multi-layer perceptron with
+# ReLU + BatchNorm + Dropout and early stopping.  Rather than feeding raw
+# ICD-10-CM multi-hot vectors (which would need a separate feature pipeline),
+# we feed the SAME tabular predictor matrix every other family receives — i.e.
+# the Barell-based injury features plus physiology/demographics.  This is the
+# pragmatic "go-around" the user asked for and keeps the FFNN comparable, on
+# identical inputs, to the boosting/linear families for BOTH mortality and the
+# ISS/NISS-band tasks.
+#
+# NOT NaN-native — requires an imputer upstream (do not pair with imputer=none).
+class _DoshiFFNNClassifier:
+    """Minimal sklearn-style classifier wrapping a PyTorch MLP.
+
+    Exposes fit / predict / predict_proba / classes_ so it slots into the
+    pipeline exactly like the TabNet adapter.  Works for binary and
+    multiclass via a softmax output + cross-entropy loss with inverse-
+    frequency class weights (helps the rare mortality positive class).
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, task: str = "binary", hidden_dims=(256, 128, 64),
+                 dropout: float = 0.3, lr: float = 1e-3, weight_decay: float = 1e-5,
+                 max_epochs: int = 100, patience: int = 10, batch_size: int = 4096,
+                 use_gpu: str = "auto", seed: int = 42, l1_lambda: float = 1e-4,
+                 icd_col: str = "ICD_DIAG_CODES", icd_features: str = "off",
+                 icd_max_vocab: int | None = None, icd_min_count: int = 1,
+                 **kwargs):
+        self.task = task
+        self.hidden_dims = tuple(hidden_dims)
+        self.dropout = dropout
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.batch_size = batch_size
+        self.use_gpu = use_gpu
+        self.seed = seed
+        self.l1_lambda = l1_lambda
+        # Faithful-Doshi ICD options:
+        #   icd_features = "off"  -> ignore ICD codes, use the numeric matrix
+        #                            (legacy behaviour);
+        #                  "only" -> use ONLY the multi-hot ICD vector (the
+        #                            faithful Doshi ICD->severity FFNN);
+        #                  "plus" -> concatenate ICD multi-hot WITH the other
+        #                            (L3) numeric features (ablation for gain).
+        self.icd_col = icd_col
+        self.icd_features = icd_features
+        self.icd_max_vocab = icd_max_vocab
+        self.icd_min_count = icd_min_count
+        self._icd_vocab = None          # list[str]; set on fit when ICD used
+        self._extra = kwargs
+        self.classes_ = None
+        self._net = None
+        self._n_features = None
+
+    @staticmethod
+    def _to_np(arr):
+        if hasattr(arr, "to_numpy"):
+            return arr.to_numpy()
+        return np.asarray(arr)
+
+    # ---- Faithful-Doshi ICD handling --------------------------------- #
+    def _uses_icd(self, X) -> bool:
+        return (self.icd_features in ("only", "plus")
+                and hasattr(X, "columns") and self.icd_col in X.columns)
+
+    def _fit_icd_vocab(self, code_lists) -> None:
+        """Build the ICD code vocabulary from the training code-list strings:
+        keep codes seen in >= icd_min_count patients, then the top
+        icd_max_vocab by document frequency."""
+        from collections import Counter
+        cnt = Counter()
+        for s in code_lists:
+            if isinstance(s, str) and s:
+                cnt.update(set(s.split()))
+        kept = [(c, n) for c, n in cnt.items() if n >= self.icd_min_count]
+        kept.sort(key=lambda kv: (-kv[1], kv[0]))
+        if self.icd_max_vocab and len(kept) > self.icd_max_vocab:
+            kept = kept[:self.icd_max_vocab]
+        self._icd_vocab = [c for c, _ in kept]
+        self._icd_index = {c: i for i, c in enumerate(self._icd_vocab)}
+        log.info("doshi_ffnn[icd]: vocabulary = %d codes (min_count=%d, cap=%s)",
+                 len(self._icd_vocab), self.icd_min_count, self.icd_max_vocab)
+
+    def _icd_multihot(self, code_lists):
+        """Return an (n × |vocab|) scipy CSR multi-hot matrix."""
+        from scipy.sparse import csr_matrix
+        idx = self._icd_index
+        rows, cols = [], []
+        for r, s in enumerate(code_lists):
+            if isinstance(s, str) and s:
+                for code in set(s.split()):
+                    j = idx.get(code)
+                    if j is not None:
+                        rows.append(r); cols.append(j)
+        data = np.ones(len(rows), dtype=np.float32)
+        return csr_matrix((data, (rows, cols)),
+                          shape=(len(code_lists), len(self._icd_vocab)),
+                          dtype=np.float32)
+
+    def _build_inputs(self, X, *, fit: bool):
+        """Return (numeric_dense [n×d] float32 or None, icd_csr [n×K] or None).
+
+        - icd_features='only': numeric=None, icd=multi-hot
+        - icd_features='plus': numeric=other cols, icd=multi-hot
+        - else                : numeric=all cols, icd=None  (legacy)
+        """
+        if self._uses_icd(X):
+            code_lists = X[self.icd_col].astype(str).tolist()
+            if fit:
+                self._fit_icd_vocab(code_lists)
+            icd = self._icd_multihot(code_lists)
+            if self.icd_features == "only":
+                return None, icd
+            num = X.drop(columns=[self.icd_col])
+            return self._to_np(num).astype(np.float32), icd
+        # legacy numeric-only path (drop ICD col if present but unused)
+        if hasattr(X, "columns") and self.icd_col in X.columns:
+            X = X.drop(columns=[self.icd_col])
+        return self._to_np(X).astype(np.float32), None
+
+    @staticmethod
+    def _batch_dense(num, icd, idx):
+        """Assemble a dense float32 minibatch from numeric array + sparse ICD."""
+        parts = []
+        if num is not None:
+            parts.append(num[idx])
+        if icd is not None:
+            parts.append(icd[idx].toarray())
+        if len(parts) == 1:
+            return parts[0]
+        return np.hstack(parts)
+
+    def _n_in(self, num, icd) -> int:
+        return (0 if num is None else num.shape[1]) + (0 if icd is None else icd.shape[1])
+
+    def _build_net(self, n_features: int, n_classes: int):
+        import torch.nn as nn
+        layers = []
+        prev = n_features
+        for h in self.hidden_dims:
+            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(),
+                       nn.Dropout(self.dropout)]
+            prev = h
+        layers += [nn.Linear(prev, n_classes)]
+        return nn.Sequential(*layers)
+
+    def fit(self, X, y, *args, **kwargs):
+        import torch
+        import torch.nn as nn
+        from sklearn.model_selection import train_test_split
+
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        device = _resolve_device(self.use_gpu)
+        self._device = device
+
+        num, icd = self._build_inputs(X, fit=True)
+        if num is not None and np.isnan(num).any():
+            log.warning("doshi_ffnn: numeric input has NaN after imputation; "
+                        "zero-filling as a last resort.")
+            num = np.nan_to_num(num, nan=0.0)
+        yn = self._to_np(y).astype(np.int64)
+
+        self.classes_ = np.array(sorted(np.unique(yn)))
+        n_classes = len(self.classes_)
+        class_to_idx = {c: i for i, c in enumerate(self.classes_)}
+        yn = np.array([class_to_idx[v] for v in yn], dtype=np.int64)
+        self._n_features = self._n_in(num, icd)
+        n = len(yn)
+
+        # Inverse-frequency class weights (helps rare positives).
+        counts = np.bincount(yn, minlength=n_classes).astype(np.float64)
+        weights = (counts.sum() / np.maximum(counts, 1.0))
+        weights = weights / weights.sum() * n_classes
+        class_weight = torch.tensor(weights, dtype=torch.float32, device=device)
+
+        # Stratified early-stopping split on ROW INDICES (sparse-safe).
+        try:
+            tr_idx, val_idx = train_test_split(
+                np.arange(n), test_size=0.1, stratify=yn, random_state=self.seed)
+        except ValueError:
+            tr_idx, val_idx = np.arange(n), np.arange(min(1, n))
+
+        self._net = self._build_net(self._n_features, n_classes).to(device)
+        opt = torch.optim.Adam(self._net.parameters(), lr=self.lr,
+                               weight_decay=self.weight_decay)
+        loss_fn = nn.CrossEntropyLoss(weight=class_weight)
+
+        ytr_t = torch.tensor(yn[tr_idx], device=device)
+        Xval = self._batch_dense(num, icd, val_idx)
+        Xval_t = torch.tensor(Xval, device=device)
+        yval_t = torch.tensor(yn[val_idx], device=device)
+
+        n_tr = len(tr_idx)
+        best_val = float("inf"); best_state = None; bad = 0
+        for epoch in range(self.max_epochs):
+            self._net.train()
+            perm = np.random.permutation(n_tr)
+            for i in range(0, n_tr, self.batch_size):
+                b = perm[i:i + self.batch_size]
+                if len(b) < 2:
+                    continue  # BatchNorm1d needs >1 sample
+                Xb = self._batch_dense(num, icd, tr_idx[b])
+                Xb_t = torch.tensor(Xb, device=device)
+                opt.zero_grad()
+                out = self._net(Xb_t)
+                loss = loss_fn(out, ytr_t[b])
+                # L1 on the first linear layer -> soft input feature selection.
+                if self.l1_lambda and self.l1_lambda > 0:
+                    loss = loss + self.l1_lambda * self._net[0].weight.abs().sum()
+                loss.backward()
+                opt.step()
+            self._net.eval()
+            with torch.no_grad():
+                vloss = float(loss_fn(self._net(Xval_t), yval_t).item())
+            if vloss < best_val - 1e-4:
+                best_val = vloss
+                best_state = {k: v.detach().clone()
+                              for k, v in self._net.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+                if bad >= self.patience:
+                    log.info("doshi_ffnn: early stop at epoch %d (val_loss=%.4f)",
+                             epoch, best_val)
+                    break
+        if best_state is not None:
+            self._net.load_state_dict(best_state)
+        return self
+
+    def predict_proba(self, X):
+        import torch
+        num, icd = self._build_inputs(X, fit=False)
+        if num is not None and np.isnan(num).any():
+            num = np.nan_to_num(num, nan=0.0)
+        n = (num.shape[0] if num is not None else icd.shape[0])
+        self._net.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, n, self.batch_size):
+                idx = np.arange(i, min(i + self.batch_size, n))
+                Xb = self._batch_dense(num, icd, idx)
+                logits = self._net(torch.tensor(Xb, device=self._device))
+                out.append(torch.softmax(logits, dim=1).cpu().numpy())
+        return np.vstack(out)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
+
+
+def doshi_ffnn(task: str, use_gpu: str = "auto", **kwargs) -> Any:
+    """Factory for the Doshi-style feed-forward network.
+
+    Available for 'binary' (mortality, ISS/NISS-band binary) and 'multiclass'
+    (ISS/NISS-band).  Requires torch; if torch is unavailable, raises a clear
+    install hint pointing at the [full] extra.
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        return _require("torch", "full")()
+    return _DoshiFFNNClassifier(task=task, use_gpu=use_gpu, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 FACTORIES = {
@@ -718,6 +1090,12 @@ FACTORIES = {
     "tpot":                  tpot,
     "tabpfn":                tabpfn,
     "tabnet":                tabnet,
+    "doshi_ffnn":            doshi_ffnn,
+    # Faithful Doshi ICD->severity FFNN variants (multi-hot ICD code input):
+    #   _icd      = ICD codes ONLY (the paper's direct ICD->ISS model);
+    #   _icd_plus = ICD multi-hot + the other L3 features (ablation for gain).
+    "doshi_ffnn_icd":        lambda task, **kw: doshi_ffnn(task, icd_features="only", **kw),
+    "doshi_ffnn_icd_plus":   lambda task, **kw: doshi_ffnn(task, icd_features="plus", **kw),
     "ft_transformer":        ft_transformer,
     "cox_ph":                cox_ph,
     "random_survival_forest": random_survival_forest,

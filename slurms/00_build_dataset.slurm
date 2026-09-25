@@ -7,8 +7,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --mem=96G
+#SBATCH --time=10:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 

@@ -95,12 +95,63 @@ def _ordinal_bands(df: pd.DataFrame, spec: dict, target_name: str = "") -> pd.Se
     return y.astype("object").where(raw.notna(), other=pd.NA).rename("target")
 
 
+def _binary_threshold(df: pd.DataFrame, spec: dict, target_name: str = "") -> pd.Series:
+    """Binarise a numeric column at a threshold.
+
+    Used for the ISS_band / NISS_band "severe vs not" problem: the classic
+    major-trauma cut is ISS >= 16, i.e. ISS > 15.  Spec keys:
+
+        variable   : source column ("ISS" / "NISS").  ``derive_from`` is also
+                     accepted as an alias.
+        threshold  : numeric cut (default 15).
+        above_is_positive : if True (default) y=1 when value > threshold
+                     (strictly greater).  Set ``inclusive=True`` to use >=.
+
+    The same AIS-alias auto-routing as ``_ordinal_bands`` applies so a YAML
+    that points at ``AISSEVERITY`` is transparently routed to ISS/NISS.
+    Rows with a NaN source value get a NaN target (dropped downstream).
+    """
+    source_col = spec.get("variable") or spec.get("derive_from")
+
+    if source_col and source_col not in df.columns:
+        original = source_col
+        upper = source_col.upper()
+        if upper == "AISSEVERITY" or upper.startswith("AIS"):
+            source_col = "NISS" if "NISS" in target_name.upper() else "ISS"
+            import logging
+            logging.getLogger(__name__).warning(
+                "Target %r references %r (a per-injury AIS column); auto-routing "
+                "to %r.  Update spec.variable in experiment_grids.yaml to silence.",
+                target_name, original, source_col,
+            )
+
+    if source_col not in df.columns:
+        candidate_cols = [c for c in df.columns if c.upper() in ("ISS", "NISS", "ISS_05")]
+        raise KeyError(
+            f"Target {target_name!r}: source column {source_col!r} not in dataframe "
+            f"— cannot build binary-threshold target.  Available severity columns: "
+            f"{candidate_cols}.  Update spec.variable in experiment_grids.yaml."
+        )
+
+    threshold = spec.get("threshold", 15)
+    inclusive = spec.get("inclusive", False)
+    raw = pd.to_numeric(df[source_col], errors="coerce")
+    if inclusive:
+        y = (raw >= threshold)
+    else:
+        y = (raw > threshold)
+    y = y.astype("Int64").where(raw.notna(), other=pd.NA)
+    return y.rename("target")
+
+
 def build_target(df: pd.DataFrame, spec: TargetSpec) -> pd.Series:
     """Return a y Series aligned with df.index, named 'target'."""
     if spec.kind == "binary":
         return _binary_mortality(df, spec.spec)
     if spec.kind == "ordinal_bands":
         return _ordinal_bands(df, spec.spec, target_name=spec.name)
+    if spec.kind == "binary_threshold":
+        return _binary_threshold(df, spec.spec, target_name=spec.name)
     if spec.kind == "survival":
         raise NotImplementedError("Survival target builder: see models.cox_ph scaffold")
     raise ValueError(f"Unknown target kind: {spec.kind!r}")

@@ -30,6 +30,13 @@ COPY src /app/src
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e ".[serve]"
 
+# Round 52: the Doshi FFNN family (model-family 'doshi_ffnn') needs PyTorch at
+# INFERENCE time to load/run a saved FFNN artifact.  Install the CPU build for
+# serving (much smaller than the CUDA build).  For GPU inference, replace this
+# with a CUDA wheel, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # Non-root user — recommended for production
 RUN useradd --create-home --shell /bin/bash apiuser
 USER apiuser

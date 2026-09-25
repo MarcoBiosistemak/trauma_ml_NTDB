@@ -54,6 +54,7 @@ def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         "prevalence": float(np.mean(y_true == 1)),
         "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
         "accuracy":  float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall":    float(recall_score(y_true, y_pred, zero_division=0)),
         "f1":        float(f1_score(y_true, y_pred, zero_division=0)),
@@ -119,26 +120,104 @@ def multiclass_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 
 
 def evaluate(model, X: pd.DataFrame, y: np.ndarray,
-             task: str, classes: list | None = None) -> dict[str, Any]:
-    """Compute performance metrics for one dataset partition."""
+             task: str, classes: list | None = None,
+             n_bootstrap: int = 0, ci_alpha: float = 0.05,
+             bootstrap_seed: int = 42) -> dict[str, Any]:
+    """Compute performance metrics for one dataset partition.
+
+    If ``n_bootstrap > 0``, also attach STRATIFIED percentile bootstrap
+    confidence intervals (default 95%) for every rate/score metric, as
+    ``<metric>__ci_low`` / ``<metric>__ci_high``.  Stratified = resample within
+    each true class so the class prevalence (and thus the metrics' sampling
+    behaviour) is preserved.  Bootstrap is OFF by default because on the full
+    NTDB partitions (300k-1M rows) the CIs are extremely tight and the resampling
+    is the dominant cost; it is most useful for subgroups and small external
+    cohorts.  See ``_bootstrap_cis``.
+    """
     y_pred = model.predict(X)
     y_proba = _get_scores(model, X)
+    # Multiclass: if the score is 1D (binary-style pos-class prob), try to get
+    # the full class-probability matrix so AUROC can be computed.  Resolve it
+    # ONCE here so both the point estimate and the bootstrap use the same proba.
+    if task == "multiclass" and y_proba is not None and getattr(y_proba, "ndim", 1) == 1:
+        full = None
+        if hasattr(model, "predict_proba"):
+            try:
+                full = model.predict_proba(X)
+            except Exception:
+                full = None
+        y_proba = full
+    metrics = _evaluate_from_preds(y, y_pred, y_proba, task, classes)
+    if n_bootstrap and n_bootstrap > 0:
+        metrics.update(_bootstrap_cis(
+            y, y_pred, y_proba, task, classes,
+            n_boot=int(n_bootstrap), alpha=ci_alpha, seed=bootstrap_seed,
+        ))
+    return metrics
+
+
+def _evaluate_from_preds(y, y_pred, y_proba, task, classes):
+    """Point-estimate metric dict from precomputed predictions (no model call)."""
     if task == "binary":
         return binary_metrics(y, y_pred, y_proba)
     if task == "multiclass":
         if classes is None:
             classes = sorted(np.unique(y).tolist())
-        # If proba is 1D (binary facade returning pos-class prob), skip AUROC
-        if y_proba is not None and y_proba.ndim == 1:
-            full = None
-            if hasattr(model, "predict_proba"):
-                try:
-                    full = model.predict_proba(X)
-                except Exception:
-                    full = None
-            y_proba = full
         return multiclass_metrics(y, y_pred, y_proba, classes)
     raise ValueError(f"Unknown task {task!r}")
+
+
+# Metric keys that are NOT rates/scores and should not get a bootstrap CI.
+_CI_SKIP_KEYS = {"n", "n_valid", "prevalence", "support",
+                 "TP", "TN", "FP", "FN", "threshold"}
+
+
+def _bootstrap_cis(y, y_pred, y_proba, task, classes,
+                   n_boot: int, alpha: float, seed: int) -> dict[str, Any]:
+    """Stratified percentile bootstrap CIs for every scalar rate/score metric.
+
+    Method: draw ``n_boot`` resamples; in each, sample row indices WITH
+    replacement separately within each true-class stratum (preserving
+    prevalence), recompute the same metric dict, and collect the distribution
+    of every numeric metric.  The CI is the (alpha/2, 1-alpha/2) percentile
+    band of that distribution.  This is assumption-light and works uniformly
+    for AUROC, AUPRC, balanced accuracy, F1, etc.  (For AUROC alone, DeLong's
+    method gives an analytic CI without resampling — faster on huge partitions,
+    but it does not generalise to the other metrics, so we use bootstrap.)
+    """
+    y = np.asarray(y)
+    y_pred = np.asarray(y_pred)
+    proba = None if y_proba is None else np.asarray(y_proba)
+    rng = np.random.default_rng(seed)
+    strata = [np.where(y == c)[0] for c in np.unique(y)]
+    strata = [s for s in strata if len(s) > 0]
+
+    samples: dict[str, list] = {}
+    for _ in range(n_boot):
+        idx = np.concatenate([rng.choice(s, size=len(s), replace=True) for s in strata])
+        pb = proba[idx] if proba is not None else None
+        m = _evaluate_from_preds(y[idx], y_pred[idx], pb, task, classes)
+        for k, v in m.items():
+            if k in _CI_SKIP_KEYS or v is None or isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                samples.setdefault(k, []).append(float(v))
+
+    lo_pct, hi_pct = 100 * alpha / 2, 100 * (1 - alpha / 2)
+    out: dict[str, Any] = {}
+    min_valid = max(20, n_boot // 5)
+    for k, vals in samples.items():
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if len(arr) >= min_valid:
+            out[f"{k}__ci_low"] = float(np.percentile(arr, lo_pct))
+            out[f"{k}__ci_high"] = float(np.percentile(arr, hi_pct))
+    out["_ci_method"] = f"stratified_percentile_bootstrap(n={n_boot}, alpha={alpha})"
+    return out
+
+
+def _evaluate_legacy_removed():  # placeholder removed in round 53
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -418,13 +497,66 @@ def compute_pareto_front(
 # Config reader
 # ---------------------------------------------------------------------------
 
+# model_id prefix -> model family, used to recover cfg_model_family when a
+# model's models/<id>/config.json is missing. That happens for models pruned by
+# an early version of prune_non_best_models.py, which deleted the whole
+# models/<id>/ directory instead of just artifact.pkl. Without this the row is
+# still aggregated but has a BLANK cfg_model_family, so the family disappears
+# from every downstream figure (this is why TPOT vanished).
+# Only unambiguous prefixes are listed: `lgr` covers two logistic variants and
+# the band-binary `*_bin_*` prefixes cover 4-5 families each, so those cannot
+# be recovered this way and are left blank.
+_PREFIX_TO_FAMILY = {
+    "xgb": "xgboost",       "lgb": "lightgbm",   "cb": "catboost",
+    "flm": "flaml",         "rf": "random_forest", "tpt": "tpot",
+    "tnt": "tabnet",        "tpf": "tabpfn",     "doshi": "doshi_ffnn",
+    "doshi_icd": "doshi_ffnn_icd", "doshi_icdplus": "doshi_ffnn_icd_plus",
+}
+
+
+def _family_from_model_id(model_id: str) -> str | None:
+    """Best-effort family recovery from a `<prefix>_<index>` model_id."""
+    import re as _re
+    m = _re.match(r"^(?P<prefix>.+?)_(?:none_)?\d{4,}$", model_id)
+    if not m:
+        return None
+    pfx = m.group("prefix")
+    for lead in ("iss_", "niss_"):        # target-scoped prefixes
+        if pfx.startswith(lead):
+            pfx = pfx[len(lead):]
+            break
+    if pfx.endswith("_none"):
+        pfx = pfx[:-5]
+    return _PREFIX_TO_FAMILY.get(pfx)
+
+
+def _safe_load_json(path, what: str = "file"):
+    """Load a JSON file, returning None instead of raising on corruption.
+
+    Long sweeps get interrupted (walltime kills, cancelled jobs, a full
+    filesystem), which can leave a metrics JSON truncated or zero-length.
+    A single such file used to abort the whole aggregation with
+    ``JSONDecodeError: Expecting value: line 1 column 1 (char 0)``, throwing
+    away thousands of perfectly good models.  We now warn and skip instead,
+    so the run still produces a table from everything that is readable.
+    """
+    import json
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError) as exc:      # ValueError covers JSONDecodeError
+        log.warning("Skipping unreadable %s %s: %s", what, path, exc)
+        return None
+
+
 def _read_config_json(model_dir: Path) -> dict:
     import json
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
         return {}
-    with open(cfg_path) as f:
-        blob = json.load(f)
+    blob = _safe_load_json(cfg_path, "config")
+    if not isinstance(blob, dict):
+        return {}
     row: dict = {}
     for key in ("family", "task"):
         if key in blob:
@@ -887,7 +1019,13 @@ def aggregate_all_metrics(
         row: dict = {"model_id": model_id}
 
         # ── 1. Config ────────────────────────────────────────────────────
-        row.update(_read_config_json(models_root / model_id))
+        cfg_row = _read_config_json(models_root / model_id)
+        if not cfg_row.get("cfg_model_family"):
+            fam = _family_from_model_id(model_id)
+            if fam:
+                cfg_row["cfg_model_family"] = fam
+                cfg_row.setdefault("cfg_family_recovered_from_id", True)
+        row.update(cfg_row)
         calibration = str(row.get("cfg_calibration", "none")).lower().strip()
         cal_suffix = f"__{calibration}" if calibration not in ("none", "", "nan") else ""
 
@@ -902,8 +1040,9 @@ def aggregate_all_metrics(
             for jf in candidates:
                 if not jf.exists():
                     continue
-                with open(jf) as f:
-                    m = json.load(f)
+                m = _safe_load_json(jf, "metrics")
+                if not isinstance(m, dict):
+                    continue          # corrupt/truncated -> try next candidate
                 for k, v in m.items():
                     row[_overall_col(k, partition)] = v
                 break
@@ -1157,8 +1296,9 @@ def aggregate_cohort_counts(
         cc_path = model_dir / "cohort_counts.json"
         if not cc_path.exists():
             continue
-        with open(cc_path) as f:
-            blob = json.load(f)
+        blob = _safe_load_json(cc_path, "cohort counts")
+        if not isinstance(blob, dict):
+            continue
 
         # Load companion variable lists if present
         vars_path = model_dir / "cohort_variables.json"

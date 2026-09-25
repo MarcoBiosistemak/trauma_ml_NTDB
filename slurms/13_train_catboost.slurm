@@ -3,13 +3,12 @@
 #SBATCH --output=slurms/logs/train_cb_%j.out
 #SBATCH --error=slurms/logs/train_cb_%j.err
 #SBATCH --partition=general
-#SBATCH --qos=xlong
+#SBATCH --qos=regular
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:rtx3090:1
-#SBATCH --mem=80G
-#SBATCH --time=4-00:00:00
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=250G
+#SBATCH --time=1-00:00:00
 #SBATCH --mail-user=marcovinicio.caporangel@bio-sistemak.eus
 #SBATCH --mail-type=END,FAIL
 
@@ -35,14 +34,38 @@ source "/scratch/${USER}/trauma_ml_venv/bin/activate"
 echo "[INFO] Slurm job ${SLURM_JOB_ID} on $(hostname)"
 nvidia-smi || echo "[WARN] nvidia-smi not available"
 
-trauma-train \
+# ── auto-resubmit on walltime ────────────────────────────────────────────
+# The resume tracker skips any combo that already wrote overall__test.json,
+# so re-running is cheap and lossless.  --signal delivers USR1 ~2 min before
+# the time limit; we resubmit ONCE then exit cleanly.  Normal completion or
+# scancel (SIGTERM) does NOT resubmit.
+SELF="slurms/13_train_catboost.slurm"
+WALL_SECONDS=86400            # keep in sync with --time (1d)
+_resubmitted=0
+_on_timeout() {
+  if [ "${_resubmitted}" -eq 0 ]; then
+    _resubmitted=1
+    echo "[INFO] $(date) nearing walltime -> resubmitting ${SELF} to resume"
+    sbatch "${SELF}" || true
+  fi
+  exit 0
+}
+trap _on_timeout USR1
+# pure-bash watchdog: signals THIS script ~4 min before the walltime so we
+# resubmit (the resume tracker skips finished combos).  No --signal needed.
+( sleep $(( WALL_SECONDS - 240 )); kill -USR1 $$ 2>/dev/null ) &
+_watchdog=$!
+trap 'kill ${_watchdog} 2>/dev/null || true' EXIT   # stop watchdog on normal finish
+run() { "$@" & wait $!; }   # background+wait so the USR1 trap fires promptly
+
+run trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
     --targets       in_hospital_mortality \
     --inclusion-strategies "Tran NTDB" \
     --predictor-types "Tran NTDB" \
     --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
-    --imputers      median_mode mice \
+    --imputers      median_mode mice bagged_trees missforest gradient_boosting \
     --model-families catboost \
     --calibrations  none platt isotonic \
     --augmentations null smote adasyn \
@@ -50,37 +73,12 @@ trauma-train \
     --use-gpu       auto \
     --model-id-prefix cb \
     --no-aggregate \
-    --n-jobs        12 \
-    --verbose
-
-# ─── Round 37: new combos in SEPARATE id-namespaces ──────────────────────
-# Appended as distinct --model-id-prefix invocations so they do NOT collide
-# with or renumber the existing cb_* models above.
-#
-# (a) imputer_check=True — impute, then drop features the imputer can't
-#     reconstruct on the calibration set.  Prefix cb_ic.
-trauma-train \
-    --dataset       outputs/datasets/unified_train.parquet \
-    --holdout-dataset outputs/datasets/unified_holdout.parquet \
-    --targets       in_hospital_mortality \
-    --inclusion-strategies "Tran NTDB" \
-    --predictor-types "Tran NTDB" \
-    --phase-cutoffs "On-scene" "On-scene + ED arrival" "On-scene + ED arrival + In-hospital" all_baseline_inputs \
-    --imputers      median_mode mice \
-    --imputer-check \
-    --model-families catboost \
-    --calibrations  none platt isotonic \
-    --augmentations null smote adasyn \
-    --missingness-thresholds 10 50 \
-    --use-gpu       auto \
-    --model-id-prefix cb_ic \
-    --no-aggregate \
-    --n-jobs        12 \
+    --n-jobs        20 \
     --verbose
 
 # (b) imputer=none — catboost handles NaN natively; no imputation.
 #     imputer_check is irrelevant (nothing to check).  Prefix cb_none.
-trauma-train \
+run trauma-train \
     --dataset       outputs/datasets/unified_train.parquet \
     --holdout-dataset outputs/datasets/unified_holdout.parquet \
     --targets       in_hospital_mortality \

@@ -56,9 +56,15 @@ and any model whose `overall__test.json` already exists is skipped instantly.
 
 | Invocation | Prefix suffix | What it does | Which families |
 |---|---|---|---|
-| base | (none, e.g. `xgb`) | impute (median_mode, mice), imputer_check=False — the original grid | all |
+| base | (none, e.g. `xgb`) | impute (median_mode, mice, **bagged_trees**), imputer_check=False — the original grid | all |
 | (a) | `_ic` (e.g. `xgb_ic`) | impute, then DROP features the imputer can't reconstruct on the calibration set | all |
 | (b) | `_none` (e.g. `xgb_none`) | no imputation; model consumes NaN directly | xgboost, lightgbm, catboost, flaml ONLY |
+
+**Round 54/55: `bagged_trees` imputer added** to the base + `_ic` invocations of
+every family (NOT `_none`). It is a MissForest-style imputer — bagged decision
+trees for numeric (`IterativeImputer`+`BaggingRegressor`) and a per-column bagged
+classifier for categoricals. It is slower than median_mode/mice, so walltimes
+were raised (4-day slurms → 7 days; tabnet slices → 3 days).
 
 **Why `_none` is restricted:** xgboost / lightgbm / catboost / flaml handle NaN
 natively (learned default split direction). logistic, random_forest, tpot,
@@ -68,11 +74,11 @@ them and they get only the base + `_ic` invocations.
 **imputer_check, briefly:** with `--imputer-check`, after fitting the imputer the
 trainer masks 10% of known values **on the calibration set** (the test set is
 left fully untouched), measures per-feature reconstruction (relative MAE for
-numeric, accuracy for categorical), and keeps only features that pass the
-thresholds (numeric MAE/std < 0.5, categorical accuracy > 0.7). The
-`imputation_eval_<method>.csv` records `keep` per feature. If NO feature
-survives, the run writes NaN metrics + a `skipped` flag and is marked done (so it
-isn't retried).
+numeric, **balanced accuracy** for categorical), and keeps only features that
+pass the thresholds (numeric MAE/std < 0.5, categorical **balanced_accuracy >=
+0.6**). The `imputation_eval_<method>.csv` records `keep` per feature. If NO
+feature survives, the run writes NaN metrics + a `skipped` flag and is marked
+done (so it isn't retried).
 
 **imputer=none collapses the check dimension:** when there's no imputation there's
 nothing to check, so `imputer=none` only ever produces the imputer_check=False

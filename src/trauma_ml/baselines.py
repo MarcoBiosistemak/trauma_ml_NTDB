@@ -156,6 +156,142 @@ def compute_triss(
     return pd.Series(triss_vals, index=df.index, name="TRISS")
 
 
+# ---------------------------------------------------------------------------
+# RTS, MGAP, mREMS — additional physiologic baselines (mortality only)
+# ---------------------------------------------------------------------------
+# All three are computed from on-scene / ED-arrival physiology + age (+
+# mechanism for MGAP), so they are valid mortality baselines.  Direction:
+#   RTS  : 0 .. 7.8408, HIGHER = better (lower mortality)
+#   MGAP : 3 .. 29,     HIGHER = better (lower mortality)
+#   mREMS: 0 .. 26,     HIGHER = WORSE  (higher mortality)
+# Each baseline_metrics/compute_baseline_scores entry converts the score to a
+# "death-risk" form in 0..1 (higher = more likely to die) for AUROC/AUPRC.
+
+
+def compute_rts(
+    df: pd.DataFrame,
+    gcs_col: str = "GCSTOTAL",
+    sbp_col: str = "SBPFIRST",
+    rr_col: str = "RRFIRST",
+) -> pd.Series:
+    """Revised Trauma Score (Champion 1989): 0.9368*GCS_c + 0.7326*SBP_c +
+    0.2908*RR_c, each coded 0-4.  Range 0-7.8408; higher = better.  Reuses the
+    same coded tables as TRISS (``_rts``)."""
+    def _num(c):
+        return pd.to_numeric(df[c], errors="coerce") if c in df.columns \
+            else pd.Series(np.nan, index=df.index, dtype=float)
+    g, s, r = _num(gcs_col), _num(sbp_col), _num(rr_col)
+    vals = np.array([_rts(gi, si, ri) for gi, si, ri in zip(g, s, r)])
+    return pd.Series(vals, index=df.index, name="RTS")
+
+
+# MGAP point tables (Sartorius 2010, Crit Care Med).  GCS enters as its raw
+# 3-15 value; the other three components are point-scored below.
+def _mgap_sbp_pts(sbp: float) -> float:
+    if pd.isna(sbp):
+        return np.nan
+    if sbp > 120:
+        return 5.0
+    if sbp >= 60:           # 60-120
+        return 3.0
+    return 0.0              # <60
+
+
+def _mgap_mech_pts(traumatype: float) -> float:
+    # NTDB TRAUMATYPE: 1=Blunt, 2=Penetrating, 3=Burn, 4=Other.
+    # MGAP: blunt +4, penetrating 0.  Burn/Other are treated as blunt (+4),
+    # and NaN falls back to blunt (+4) — the conservative (lower-risk) choice.
+    if pd.isna(traumatype):
+        return 4.0
+    return 0.0 if int(traumatype) == 2 else 4.0
+
+
+def compute_mgap(
+    df: pd.DataFrame,
+    gcs_col: str = "GCSTOTAL",
+    sbp_col: str = "SBPFIRST",
+    age_col: str = "AGEYEARS",
+    mech_col: str = "TRAUMATYPE",
+) -> pd.Series:
+    """MGAP = GCS(3-15) + mechanism(blunt 4 / penetrating 0) + SBP(>120:5,
+    60-120:3,<60:0) + age(<60:5,>=60:0).  Range 3-29; higher = better."""
+    def _num(c):
+        return pd.to_numeric(df[c], errors="coerce") if c in df.columns \
+            else pd.Series(np.nan, index=df.index, dtype=float)
+    gcs, sbp, age = _num(gcs_col), _num(sbp_col), _num(age_col)
+    mech = _num(mech_col)
+    sbp_pts = sbp.map(_mgap_sbp_pts)
+    mech_pts = mech.map(_mgap_mech_pts)
+    age_pts = age.map(lambda a: np.nan if pd.isna(a) else (5.0 if a < 60 else 0.0))
+    mgap = gcs + sbp_pts + mech_pts + age_pts   # NaN propagates if gcs/sbp/age NaN
+    return pd.Series(mgap.to_numpy(), index=df.index, name="MGAP")
+
+
+# mREMS point tables (Miller 2017, Injury 48:1870, Table 1).  Each variable is
+# 0-4 except GCS (0-6); max 26; HIGHER = worse.  Miller modified REMS by
+# re-weighting age (down) and GCS (up) and substituting SBP for MAP; HR/RR/SpO2
+# keep the original REMS coding.  NOTE: the published Table 1 is typographically
+# ambiguous for the SBP/HR extreme brackets — the breakpoints below are our
+# best faithful reading; adjust these constants if your reading differs.  The
+# score DIRECTION (higher = worse) and the AUROC comparison are robust to
+# +/-1-point boundary shifts.
+_MREMS_AGE  = [(0, 44, 0), (45, 64, 1), (65, 74, 2), (75, 10**9, 3)]
+_MREMS_SBP  = [(110, 159, 0), (90, 109, 1), (160, 199, 1),
+               (80, 89, 2), (200, 10**9, 2), (0, 79, 3)]
+_MREMS_HR   = [(70, 109, 0), (55, 69, 2), (110, 139, 2),
+               (40, 54, 3), (140, 179, 3), (0, 39, 4), (180, 10**9, 4)]
+_MREMS_RR   = [(12, 24, 0), (10, 11, 1), (25, 34, 1), (6, 9, 2),
+               (35, 49, 3), (0, 5, 4), (50, 10**9, 4)]
+_MREMS_SPO2 = [(90, 10**9, 0), (86, 89, 1), (75, 85, 3), (0, 74, 4)]
+_MREMS_GCS  = [(14, 15, 0), (8, 13, 2), (5, 7, 4), (3, 4, 6)]
+
+
+def _mrems_pts(value: float, table: list[tuple]) -> float:
+    if pd.isna(value):
+        return np.nan
+    for lo, hi, pts in table:
+        if lo <= value <= hi:
+            return float(pts)
+    return np.nan
+
+
+def compute_mrems(
+    df: pd.DataFrame,
+    age_col: str = "AGEYEARS",
+    sbp_col: str = "SBPFIRST",
+    hr_col: str = "PULSERATE",
+    rr_col: str = "RRFIRST",
+    spo2_col: str = "PULSEOXIMETRY",
+    gcs_col: str = "GCSTOTAL",
+) -> pd.Series:
+    """modified Rapid Emergency Medicine Score (Miller 2017).  Sum of points
+    for age, SBP, heart rate, respiratory rate, SpO2 and GCS.  Range 0-26;
+    higher = higher mortality.  Any NaN input component makes the row NaN."""
+    def _num(c):
+        return pd.to_numeric(df[c], errors="coerce") if c in df.columns \
+            else pd.Series(np.nan, index=df.index, dtype=float)
+    age = _num(age_col).map(lambda v: _mrems_pts(v, _MREMS_AGE))
+    sbp = _num(sbp_col).map(lambda v: _mrems_pts(v, _MREMS_SBP))
+    hr = _num(hr_col).map(lambda v: _mrems_pts(v, _MREMS_HR))
+    rr = _num(rr_col).map(lambda v: _mrems_pts(v, _MREMS_RR))
+    spo2 = _num(spo2_col).map(lambda v: _mrems_pts(v, _MREMS_SPO2))
+    gcs = _num(gcs_col).map(lambda v: _mrems_pts(v, _MREMS_GCS))
+    mrems = age + sbp + hr + rr + spo2 + gcs
+    return pd.Series(mrems.to_numpy(), index=df.index, name="mREMS")
+
+
+# Clinical reference cut-points used ONLY for the thresholded metrics
+# (accuracy/recall/precision/F1).  AUROC/AUPRC are threshold-free and are the
+# primary comparison.  RTS<4 = severe (classic); MGAP<18 = Sartorius high-risk;
+# mREMS>=12 = Miller high-risk zone.
+_RTS_DEATH_CUT = 4.0
+_MGAP_DEATH_CUT = 18.0
+_MREMS_DEATH_CUT = 12.0
+_RTS_MAX = 7.8408
+_MGAP_MIN, _MGAP_MAX = 3.0, 29.0
+_MREMS_MAX = 26.0
+
+
 def baseline_metrics(
     df: pd.DataFrame,
     y: np.ndarray,
@@ -274,6 +410,43 @@ def baseline_metrics(
             int(valid_t.sum()),
         )
 
+    # --- RTS / MGAP / mREMS (physiologic baselines) ---------------------
+    # Each is a continuous score; we convert to a 0..1 death-risk for
+    # AUROC/AUPRC and threshold at a clinical reference cut for the
+    # confusion-based metrics.
+    def _continuous_baseline(name, score_series, death_risk, death_pred):
+        valid_m = score_series.notna() & ~y_series_isna
+        if valid_m.sum() < 10:
+            log.warning("%s baseline skipped: only %d valid rows (need >=10).",
+                        name, int(valid_m.sum()))
+            return
+        m = valid_m.to_numpy()
+        results[name] = binary_metrics(y[m], death_pred[m].astype(int),
+                                       death_risk[m])
+        results[name]["n_valid"] = int(valid_m.sum())
+        log.info("%s baseline: n=%d, AUROC=%s", name, int(valid_m.sum()),
+                 f"{results[name].get('AUROC', float('nan')):.3f}")
+
+    rts = compute_rts(df)
+    _continuous_baseline(
+        "RTS", rts,
+        death_risk=np.clip(1.0 - rts.to_numpy() / _RTS_MAX, 0.0, 1.0),
+        death_pred=(rts < _RTS_DEATH_CUT),
+    )
+    mgap = compute_mgap(df)
+    _continuous_baseline(
+        "MGAP", mgap,
+        death_risk=np.clip((_MGAP_MAX - mgap.to_numpy()) / (_MGAP_MAX - _MGAP_MIN),
+                           0.0, 1.0),
+        death_pred=(mgap < _MGAP_DEATH_CUT),
+    )
+    mrems = compute_mrems(df)
+    _continuous_baseline(
+        "mREMS", mrems,
+        death_risk=np.clip(mrems.to_numpy() / _MREMS_MAX, 0.0, 1.0),
+        death_pred=(mrems >= _MREMS_DEATH_CUT),
+    )
+
     return results
 
 
@@ -361,5 +534,32 @@ def compute_baseline_scores(
             "score": death_score, "pred": pred, "valid": valid_t,
             "threshold": triss_threshold,
         }
+
+    # RTS / MGAP / mREMS — continuous physiologic baselines.
+    def _add_continuous(name, score_series, death_risk, death_pred, cut):
+        valid_m = score_series.notna()
+        if valid_m.sum() < 10:
+            return
+        vm = valid_m.to_numpy()
+        out[name] = {
+            "score": np.where(vm, death_risk, np.nan),
+            "pred":  np.where(vm, death_pred.astype(int), -1),
+            "valid": valid_m,
+            "threshold": cut,
+        }
+
+    rts = compute_rts(df)
+    _add_continuous("RTS", rts,
+                    np.clip(1.0 - rts.to_numpy() / _RTS_MAX, 0.0, 1.0),
+                    (rts < _RTS_DEATH_CUT).to_numpy(), _RTS_DEATH_CUT)
+    mgap = compute_mgap(df)
+    _add_continuous("MGAP", mgap,
+                    np.clip((_MGAP_MAX - mgap.to_numpy()) / (_MGAP_MAX - _MGAP_MIN),
+                            0.0, 1.0),
+                    (mgap < _MGAP_DEATH_CUT).to_numpy(), _MGAP_DEATH_CUT)
+    mrems = compute_mrems(df)
+    _add_continuous("mREMS", mrems,
+                    np.clip(mrems.to_numpy() / _MREMS_MAX, 0.0, 1.0),
+                    (mrems >= _MREMS_DEATH_CUT).to_numpy(), _MREMS_DEATH_CUT)
 
     return out

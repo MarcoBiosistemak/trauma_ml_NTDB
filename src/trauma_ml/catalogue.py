@@ -79,6 +79,10 @@ NON_PREDICTOR_COLUMNS = {
 
     # Inter-facility transfer flag (post-hoc admin)
     "INTERFACILITYTRANSFER",
+
+    # Round 56: ED length-of-stay — LEAKAGE for mortality (an ED death's
+    # "ED discharge" is the death event; ED LOS is fixed by the disposition).
+    "EDDISCHARGEHRS",
 }
 
 # Case-insensitive lookup set — ALL comparisons against the blacklist must
@@ -87,6 +91,16 @@ NON_PREDICTOR_COLUMNS = {
 # (some columns are upper, some lower, some camel) and the loader's
 # alias-resolver normalises to canonical names AFTER the filter runs.
 NON_PREDICTOR_COLUMNS_LOWER = {c.lower() for c in NON_PREDICTOR_COLUMNS}
+
+# Columns carried in the dataset but NOT run through the standard
+# encoders/scalers/imputer/pre-filter — a model that knows how to consume them
+# handles them itself.  ICD_DIAG_CODES is the raw per-patient ICD-10 code-list
+# string, vectorised to a multi-hot inside the (faithful) Doshi ICD FFNN.
+PASSTHROUGH_COLUMNS = {"ICD_DIAG_CODES"}
+
+
+def is_passthrough(column_name: str) -> bool:
+    return column_name in PASSTHROUGH_COLUMNS
 
 
 def is_non_predictor(column_name: str) -> bool:
@@ -156,124 +170,103 @@ BASELINE_FEATURE_CUTOFFS: dict[str, list[str]] = {
 # This is intentional — explicit beats clever.
 #
 # Time-ordered cutoffs (each ADDS to the previous):
+# ---------------------------------------------------------------------------
+# Injury-description (Barell / Tran-specific) feature names.
+# Populated by ntdb_loader.merge_barell_features at build time.  These are
+# DISCHARGE-CODED (ICD-10-CM, finalised a posteriori), so for an OUTCOME
+# target (mortality) they belong ONLY at the in-hospital cutoff.  For an
+# INJURY-SEVERITY target (ISS_band / NISS_band) they may be used at every
+# phase (the task is "predict the severity band from the injuries"), which
+# the trainer enables via variables_for(..., include_injury_features=True).
+INJURY_FEATURES: list[str] = [
+    "BARELL_TBI", "BARELL_OTHER_HEAD", "BARELL_FACE", "BARELL_NECK",
+    "BARELL_SCI", "BARELL_VERTEBRAL_NO_SCI",
+    "BARELL_THORAX", "BARELL_ABDOMEN_PELVIS",
+    "BARELL_UPPER_EXTREMITY", "BARELL_LOWER_EXTREMITY",
+    "BARELL_BURNS", "BARELL_SYSTEM_OR_OTHER",
+    "INJ_SUBDURAL_HEMORRHAGE", "INJ_CONCUSSION", "INJ_PNEUMOTHORAX",
+    "INJ_RIB_FRACTURE_MULTIPLE", "INJ_SPLENIC_LACERATION",
+    "INJ_LIVER_LACERATION", "INJ_PELVIC_FRACTURE",
+    "INJ_FEMUR_FRACTURE", "INJ_DISTAL_RADIUS_FRACTURE", "INJ_FOOT_FRACTURE",
+]
+
+
+# ---------------------------------------------------------------------------
+# Round 51: HARD-CODED phase-cutoff predictor lists (composed from blocks).
+# ---------------------------------------------------------------------------
+# SOLE source of truth for which variables are used at each phase cutoff.
+# Built from shared sub-blocks so the three time-ordered cutoffs stay in
+# sync and we cannot accidentally reference a column that does not exist.
+#
+# Temporal-correctness rules enforced here:
+#   * Injury-description features (Barell/INJ_*) are NOT on-scene/ED-arrival
+#     for outcome targets — they are discharge-coded, so they live only in
+#     the in-hospital cutoff (re-enabled for band targets by the trainer).
+#   * ISS / NISS (AIS-derived, a posteriori) live only in the in-hospital
+#     cutoff.
+#   * Only genuinely time-stamped physiology / events sit in on-scene/ED.
+#
+# Column names below are the REAL NTDB variables (or loader-produced
+# canonicals): SBPFIRST<-SBP, RRFIRST<-RESPIRATORYRATE, GCSTOTAL<-TOTALGCS;
+# PRIMARYMETHODPAYMENT (not "PRIMARYINSURANCE"); there is no native single
+# "RACE" column (NTDB ships RACE_* category flags) so RACE is omitted; the
+# "ED*"-prefixed and "*HIGHEST/*LOWEST" columns do NOT exist natively and
+# have been removed (the base first-recorded vitals already represent the
+# ED-arrival measurement).
+
+# Demographics knowable at first contact (Tran 2022 S1 Table).
+# PRIMARYMETHODPAYMENT (insurance/payer) is kept as an admission-time
+# economic/administrative feature; it is also used as a sociodemographic
+# SUBGROUP axis (fairness/equity reporting) for every target.
+_DEMOGRAPHICS = ["AGEYEARS", "SEX", "ETHNICITY", "PRIMARYMETHODPAYMENT"]
+# Anthropometry (numeric), known at admission -> on-scene/first-contact layer.
+_ANTHRO = ["HEIGHT", "WEIGHT"]
+# Mechanism / intent — describe WHAT happened (ECODE lookup).
+_MECHANISM = ["TRAUMATYPE", "MECHANISM", "INTENT"]
+# On-scene / first-contact physiology (first-recorded values).
+_ONSCENE_PHYS = ["GCSTOTAL", "SBPFIRST", "RRFIRST"]
+# Comorbidities — pre-existing, knowable from history (Tran 2022 S1 Table).
+_COMORBID = [
+    "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
+    "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
+    "DIABETESMELLITUS", "BLEEDINGDISORDER", "DISSEMINATEDCANCER",
+    "ALCOHOLUSEDISORDER", "MENTALPERSONALITYDISORDER",
+    "SUBSTANCEABUSEDISORDERDRUG", "ATTENTIONDEFICITDISORDER",
+    "DEMENTIA", "ADVANCEDDIRECTIVELIMITINGCARE",
+    "FUNCTIONALLYDEPENDENTHEALTHSTATUS",
+]
+# On-scene events / transport (all NTDB years).
+_L1_EXTRA = ["TRANSPORTMODE", "PREHOSPITALCARDIACARREST"]
+# ED-arrival physiology (first-recorded temp / SpO2 / pulse).
+_ED_VITALS = ["TEMPERATURE", "PULSEOXIMETRY", "PULSERATE"]
+# ED-arrival extras (all NTDB years).  HOSPITALARRIVALHRS = time from
+# incident to ED/hospital arrival (the prehospital "trip" interval, known
+# at arrival); pupils + ED alcohol screen.  (NTDB has NO drug-screen field;
+# only ALCOHOLSCREEN[/RESULT] exist.)
+_L2_EXTRA = [
+    "HOSPITALARRIVALHRS", "TBIPUPILLARYRESPONSE",
+    "ALCOHOLSCREEN", "ALCOHOLSCREENRESULT",
+]
+# Anatomy scores (AIS-derived, a posteriori).
+_ANATOMY = ["ISS", "NISS"]
+# In-hospital extras.  (EDDISCHARGEHRS = ED length-of-stay was REMOVED in
+# round 56: for the mortality target it leaks — an ED death's "ED discharge"
+# IS the death event, so EDDISCHARGEHRS is time-to-death for those cases, and
+# in general ED LOS is fixed by the disposition (died/admitted/home) and so is
+# only known once the outcome is.  Dropped for all targets to be safe.)
+_L3_EXTRA: list[str] = []
+
+_ONSCENE_LIST = (_DEMOGRAPHICS + _ANTHRO + _MECHANISM + _ONSCENE_PHYS
+                 + _COMORBID + _L1_EXTRA)
+_ED_LIST = _ONSCENE_LIST + _ED_VITALS + _L2_EXTRA
+_INHOSP_LIST = _ED_LIST + list(INJURY_FEATURES) + _ANATOMY + _L3_EXTRA
+
 PHASE_CUTOFF_PREDICTORS: dict[str, list[str]] = {
-    # On-scene: what EMS / first responders capture at the patient's side.
-    # *FIRST columns are "first-recorded value anywhere in patient journey",
-    # which for prehospital arrivals is the EMS measurement.  Demographics
-    # (age, sex, race, ethnicity, insurance) and pre-existing comorbidities
-    # are knowable on first contact — they're added here per Tran 2022's
-    # "Complete XGBoost" model (S1 Table).  Mechanism/intent come from the
-    # ECODE lookup that the loader joins on PRIMARYECODEICD10; they describe
-    # WHAT happened, not WHEN it was recorded, so they belong here too.
-    # Round 27: Barell injury features (ICD-10-derived body regions + Tran's
-    # high-impact specific injuries) are also "knowable on first contact"
-    # because the ICD code describes an injury that exists at admission.
-    "On-scene": [
-        # Demographics (Tran 2022 S1 Table)
-        "AGEYEARS", "SEX", "RACE", "ETHNICITY", "PRIMARYINSURANCE",
-        # Mechanism / intent (derived from ECODE lookup)
-        "TRAUMATYPE", "MECHANISM", "INTENT",
-        # On-scene physiology
-        "GCSTOTAL", "SBPFIRST", "RRFIRST",
-        # Comorbidities — Tran 2022 S1 Table set
-        # (knowable on first contact via past medical history)
-        "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
-        "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
-        "DIABETESMELLITUS", "BLEEDINGDISORDER", "DISSEMINATEDCANCER",
-        "ALCOHOLUSEDISORDER", "MENTALPERSONALITYDISORDER",
-        "SUBSTANCEABUSEDISORDERDRUG", "ATTENTIONDEFICITDISORDER",
-        "DEMENTIA", "ADVANCEDDIRECTIVELIMITINGCARE",
-        "FUNCTIONALLYDEPENDENTHEALTHSTATUS",
-        # Round 27: Barell injury features (ICD-10 → 12 body regions +
-        # 10 Tran-flagged specific injuries).  These are populated by
-        # ntdb_loader.merge_barell_features at build time.
-        "BARELL_TBI", "BARELL_OTHER_HEAD", "BARELL_FACE", "BARELL_NECK",
-        "BARELL_SCI", "BARELL_VERTEBRAL_NO_SCI",
-        "BARELL_THORAX", "BARELL_ABDOMEN_PELVIS",
-        "BARELL_UPPER_EXTREMITY", "BARELL_LOWER_EXTREMITY",
-        "BARELL_BURNS", "BARELL_SYSTEM_OR_OTHER",
-        "INJ_SUBDURAL_HEMORRHAGE", "INJ_CONCUSSION", "INJ_PNEUMOTHORAX",
-        "INJ_RIB_FRACTURE_MULTIPLE", "INJ_SPLENIC_LACERATION",
-        "INJ_LIVER_LACERATION", "INJ_PELVIC_FRACTURE",
-        "INJ_FEMUR_FRACTURE", "INJ_DISTAL_RADIUS_FRACTURE",
-        "INJ_FOOT_FRACTURE",
-    ],
-
-    # On-scene + ED arrival: adds vitals captured AT THE ED itself.
-    # NTDB stores BOTH the *FIRST values (initial vital regardless of where
-    # taken) AND the ED-specific measurements (EDSBP / EDPULSERATE / ...).
-    # We include both — the model can learn whichever is more informative.
-    # Adding these is round-26 per the user request to capture ED-arrival
-    # SBP/RR/GCS measurements explicitly.
-    "On-scene + ED arrival": [
-        # All on-scene predictors
-        "AGEYEARS", "SEX", "RACE", "ETHNICITY", "PRIMARYINSURANCE",
-        "TRAUMATYPE", "MECHANISM", "INTENT",
-        "GCSTOTAL", "SBPFIRST", "RRFIRST",
-        "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
-        "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
-        "DIABETESMELLITUS", "BLEEDINGDISORDER", "DISSEMINATEDCANCER",
-        "ALCOHOLUSEDISORDER", "MENTALPERSONALITYDISORDER",
-        "SUBSTANCEABUSEDISORDERDRUG", "ATTENTIONDEFICITDISORDER",
-        "DEMENTIA", "ADVANCEDDIRECTIVELIMITINGCARE",
-        "FUNCTIONALLYDEPENDENTHEALTHSTATUS",
-        "BARELL_TBI", "BARELL_OTHER_HEAD", "BARELL_FACE", "BARELL_NECK",
-        "BARELL_SCI", "BARELL_VERTEBRAL_NO_SCI",
-        "BARELL_THORAX", "BARELL_ABDOMEN_PELVIS",
-        "BARELL_UPPER_EXTREMITY", "BARELL_LOWER_EXTREMITY",
-        "BARELL_BURNS", "BARELL_SYSTEM_OR_OTHER",
-        "INJ_SUBDURAL_HEMORRHAGE", "INJ_CONCUSSION", "INJ_PNEUMOTHORAX",
-        "INJ_RIB_FRACTURE_MULTIPLE", "INJ_SPLENIC_LACERATION",
-        "INJ_LIVER_LACERATION", "INJ_PELVIC_FRACTURE",
-        "INJ_FEMUR_FRACTURE", "INJ_DISTAL_RADIUS_FRACTURE",
-        "INJ_FOOT_FRACTURE",
-        # Plus first-recorded vitals (from *FIRST columns)
-        "TEMPERATURE", "PULSEOXIMETRY", "PULSERATE",
-        # Plus ED-specific measurements
-        "EDSBP", "EDPULSERATE", "EDTEMPERATURE",
-        "EDRESPIRATORYRATE", "EDOXYGENSATURATION", "EDGCSTOTAL",
-    ],
-
-    # On-scene + ED arrival + In-hospital: adds anatomic injury severity
-    # (ISS / NISS, derived from AIS codes a posteriori) and the highest
-    # 24-hour vital values (Tran 2022's Base ML uses these — *_24H columns
-    # if present).
-    "On-scene + ED arrival + In-hospital": [
-        # Everything from the previous cutoff
-        "AGEYEARS", "SEX", "RACE", "ETHNICITY", "PRIMARYINSURANCE",
-        "TRAUMATYPE", "MECHANISM", "INTENT",
-        "GCSTOTAL", "SBPFIRST", "RRFIRST",
-        "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
-        "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
-        "DIABETESMELLITUS", "BLEEDINGDISORDER", "DISSEMINATEDCANCER",
-        "ALCOHOLUSEDISORDER", "MENTALPERSONALITYDISORDER",
-        "SUBSTANCEABUSEDISORDERDRUG", "ATTENTIONDEFICITDISORDER",
-        "DEMENTIA", "ADVANCEDDIRECTIVELIMITINGCARE",
-        "FUNCTIONALLYDEPENDENTHEALTHSTATUS",
-        "BARELL_TBI", "BARELL_OTHER_HEAD", "BARELL_FACE", "BARELL_NECK",
-        "BARELL_SCI", "BARELL_VERTEBRAL_NO_SCI",
-        "BARELL_THORAX", "BARELL_ABDOMEN_PELVIS",
-        "BARELL_UPPER_EXTREMITY", "BARELL_LOWER_EXTREMITY",
-        "BARELL_BURNS", "BARELL_SYSTEM_OR_OTHER",
-        "INJ_SUBDURAL_HEMORRHAGE", "INJ_CONCUSSION", "INJ_PNEUMOTHORAX",
-        "INJ_RIB_FRACTURE_MULTIPLE", "INJ_SPLENIC_LACERATION",
-        "INJ_LIVER_LACERATION", "INJ_PELVIC_FRACTURE",
-        "INJ_FEMUR_FRACTURE", "INJ_DISTAL_RADIUS_FRACTURE",
-        "INJ_FOOT_FRACTURE",
-        "TEMPERATURE", "PULSEOXIMETRY", "PULSERATE",
-        "EDSBP", "EDPULSERATE", "EDTEMPERATURE",
-        "EDRESPIRATORYRATE", "EDOXYGENSATURATION", "EDGCSTOTAL",
-        # Anatomy scores
-        "ISS", "NISS",
-        # Highest 24-hour vitals (Tran "Base XGBoost" model uses these)
-        # The loader populates these from *_24H NTDB columns when present.
-        "SBPHIGHEST", "RRHIGHEST", "GCSHIGHEST",
-        "SBPLOWEST", "RRLOWEST", "GCSLOWEST",
-    ],
+    "On-scene": list(_ONSCENE_LIST),
+    "On-scene + ED arrival": list(_ED_LIST),
+    "On-scene + ED arrival + In-hospital": list(_INHOSP_LIST),
 
     # Baseline-feature cutoffs (pinned to one clinical score's exact inputs).
-    # NO comorbidities, NO demographics other than age/sex — these are the
-    # CLINICAL SCORE's inputs only, used for direct ML-vs-baseline benchmarking.
     "iss_only": [
         "ISS",
         "AGEYEARS", "SEX",
@@ -307,8 +300,12 @@ PHASE_CUTOFF_PREDICTORS: dict[str, list[str]] = {
 SEMANTIC_CATEGORICALS = {
     # Sex / mechanism / intent are coded integers but discrete categories
     "SEX", "TRAUMATYPE", "MECHANISM", "INTENT",
-    # Demographics
-    "RACE", "ETHNICITY", "PRIMARYINSURANCE",
+    # Demographics (there is no single native RACE column).  PRIMARYMETHODPAYMENT
+    # (insurance/payer) is a coded categorical and also a subgroup axis.
+    "ETHNICITY", "PRIMARYMETHODPAYMENT",
+    # Round 51: integer-coded categoricals newly added as predictors
+    "TRANSPORTMODE", "TBIPUPILLARYRESPONSE", "PREHOSPITALCARDIACARREST",
+    "ALCOHOLSCREEN",
     # Comorbidity flags (Y/N or 1/0)
     "SMOKINGSTATUS", "COPD", "CHF", "MI", "HYPERTENSION",
     "PERIPHERALVASCULARDISEASE", "ESRD", "CIRRHOSIS",
@@ -458,6 +455,40 @@ class Catalogue:
     def all_variables(self) -> list[str]:
         return list(self._entries.keys())
 
+    def incremental_phase_blocks(
+        self,
+        phase_cutoff: str,
+        registries: Iterable[str] | None = None,
+        include_target_derivers: bool = False,
+    ) -> dict[str, set]:
+        """Return the INCREMENTAL variable blocks up to ``phase_cutoff``.
+
+        Keys are 'on_scene', 'ed_arrival', 'in_hospital' (only those at/under
+        the cutoff and non-empty).  Each value is the set of NEW variables that
+        phase contributes, bounded by the requested cutoff.  Used to build the
+        'phase-complete' evaluation slice (rows with >=1 real value per block).
+        """
+        target = set(self.variables_for(
+            phase_cutoff=phase_cutoff, registries=registries,
+            include_target_derivers=include_target_derivers))
+        order = [("on_scene", "On-scene"),
+                 ("ed_arrival", "On-scene + ED arrival"),
+                 ("in_hospital", "On-scene + ED arrival + In-hospital")]
+        blocks: dict[str, set] = {}
+        prev: set = set()
+        for name, cut in order:
+            try:
+                cur = set(self.variables_for(
+                    phase_cutoff=cut, registries=registries,
+                    include_target_derivers=include_target_derivers)) & target
+            except Exception:
+                cur = prev
+            block = cur - prev
+            if block:
+                blocks[name] = block
+            prev = cur
+        return blocks
+
     def variables_for(
         self,
         year: int | None = None,
@@ -465,6 +496,7 @@ class Catalogue:
         registries: Iterable[str] | None = None,
         categories: Iterable[str] | None = None,
         include_target_derivers: bool = True,
+        include_injury_features: bool = False,
     ) -> list[str]:
         """Return NTDB variable names matching all filters.
 
@@ -481,6 +513,14 @@ class Catalogue:
         include_target_derivers : if True, also keep variables that can be used
             to derive the target (mortality, ISS, NISS) even if they violate the
             phase or category filters.
+        include_injury_features : if True, add the injury-description features
+            (Barell / INJ_*) regardless of phase cutoff.  Used for ISS_band /
+            NISS_band targets, where predicting the severity band from the
+            injuries themselves is the task and those features are therefore
+            legitimate at every phase.  ISS / NISS themselves remain excluded
+            by the caller's target-column filter.  For outcome targets
+            (mortality) this stays False, so injury features appear only at
+            the in-hospital cutoff (where PHASE_CUTOFF_PREDICTORS lists them).
         """
         # ── Round 21: HARD-CODED phase cutoff predictor lists ─────────────
         # The catalogue xlsx's Phase column and Tran 2022 registry flag are
@@ -504,6 +544,9 @@ class Catalogue:
                     "ICDDIAGNOSISCODE",
                 ]
                 out.extend(target_deriver_names)
+            # Round 51: for band targets, allow injury features at every phase.
+            if include_injury_features:
+                out.extend(INJURY_FEATURES)
             # Always strip the non-predictor blacklist (case-insensitive).
             return sorted({c for c in set(out) if not is_non_predictor(c)})
 
@@ -570,6 +613,10 @@ class Catalogue:
                 continue
 
             out.append(name)
+
+        # Round 51: band-target injury features (parity with hard-coded path).
+        if include_injury_features:
+            out.extend(INJURY_FEATURES)
 
         # Round 18: hard-blacklist IDs and hospital-level admin columns
         # before returning.  Round 19: case-insensitive — see is_non_predictor.

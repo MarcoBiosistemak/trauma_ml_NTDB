@@ -70,6 +70,11 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
+# Round 51: if the strict initial-encounter ('A' suffix) filter would retain
+# fewer than this fraction of codes, assume the data lacks the 7th-character
+# extension and fall back to using all codes (see compute_barell_features).
+MIN_INITIAL_ENCOUNTER_FRAC = 0.10
+
 
 # ---------------------------------------------------------------------------
 # Body-region rules (in priority order — first match wins for each ICD code)
@@ -350,15 +355,38 @@ def compute_barell_features(
     # Filter to initial-encounter codes (7th character == 'A') if requested.
     # ICD-10-CM injury codes have a 7-character form like 'S065X1A' where the
     # last char encodes the encounter type (A=initial, D=subsequent, S=sequela).
+    #
+    # Round 51 (relaxation): some NTDB extracts store ICDDIAGNOSISCODE WITHOUT
+    # the 7th-character encounter extension (e.g. 'S065' or 'S06.5').  Applying
+    # the strict 'A' filter to such data drops every code and silently yields
+    # all-zero Barell features — the exact failure we are trying to avoid.
+    # We therefore apply the filter ADAPTIVELY: if keeping only initial-
+    # encounter codes would retain less than MIN_INITIAL_ENCOUNTER_FRAC of the
+    # codes (i.e. the data almost certainly lacks the extension), we fall back
+    # to using ALL codes and emit a loud warning instead of nuking everything.
     if require_initial_encounter:
         before = len(df)
-        df = df[df["_code_norm"].str.len() >= 7]
-        df = df[df["_code_norm"].str[-1] == "A"]
-        log.info(
-            "compute_barell_features: kept %d / %d codes after "
-            "initial-encounter filter (suffix 'A')",
-            len(df), before,
-        )
+        has_ext = (df["_code_norm"].str.len() >= 7) & (df["_code_norm"].str[-1] == "A")
+        kept = int(has_ext.sum())
+        frac = kept / before if before else 0.0
+        if before > 0 and frac < MIN_INITIAL_ENCOUNTER_FRAC:
+            log.warning(
+                "compute_barell_features: initial-encounter filter would keep "
+                "only %d / %d codes (%.2f%%) — the diagnosis codes appear to "
+                "lack the 7th-character encounter extension (e.g. stored as "
+                "'S065' rather than 'S065X1A'). FALLING BACK to using ALL codes "
+                "so Barell features are not all-zero. Set "
+                "require_initial_encounter=False to silence this.",
+                kept, before, 100 * frac,
+            )
+            # leave df unfiltered
+        else:
+            df = df[has_ext]
+            log.info(
+                "compute_barell_features: kept %d / %d codes after "
+                "initial-encounter filter (suffix 'A')",
+                kept, before,
+            )
 
     if len(df) == 0:
         log.warning(
@@ -417,9 +445,75 @@ def compute_barell_features(
 # ---------------------------------------------------------------------------
 # Loader-side convenience wrapper
 # ---------------------------------------------------------------------------
+ICD_CODE_LIST_COL = "ICD_DIAG_CODES"
+
+
+def collect_icd_codes(
+    diagnosis_long: pd.DataFrame,
+    inc_key_col: str = "INC_KEY",
+    code_col: str = "ICDDIAGNOSISCODE",
+) -> pd.DataFrame:
+    """Return one row per patient with a space-joined string of their
+    normalised ICD-10-CM diagnosis codes (the raw input for the faithful
+    Doshi ICD→severity FFNN).  Codes are de-duplicated per patient and the
+    7th-character encounter extension is kept off (we use the dot-free,
+    normalised code so the model's vocabulary is stable across years)."""
+    empty = pd.DataFrame(columns=[inc_key_col, ICD_CODE_LIST_COL])
+    if diagnosis_long is None or len(diagnosis_long) == 0:
+        return empty
+    cols_lower = {c.lower(): c for c in diagnosis_long.columns}
+    inc_actual = cols_lower.get(inc_key_col.lower())
+    code_actual = cols_lower.get(code_col.lower())
+    if code_actual is None:
+        for alt in ("ICDDIAGNOSIS", "ICDCODE", "DIAGNOSISCODE"):
+            if alt.lower() in cols_lower:
+                code_actual = cols_lower[alt.lower()]
+                break
+    if inc_actual is None or code_actual is None:
+        log.warning("collect_icd_codes: missing inc_key/code column — "
+                    "no ICD code lists produced.")
+        return empty
+    df = diagnosis_long[[inc_actual, code_actual]].copy()
+    df.columns = [inc_key_col, "_code"]
+    df["_code_norm"] = df["_code"].map(_normalise_icd10)
+    df = df[df["_code_norm"] != ""]
+    if df.empty:
+        return empty
+    grouped = (df.groupby(inc_key_col)["_code_norm"]
+                 .agg(lambda s: " ".join(sorted(set(s))))
+                 .reset_index())
+    grouped.columns = [inc_key_col, ICD_CODE_LIST_COL]
+    return grouped
+
+
+def merge_icd_code_list(
+    trauma: pd.DataFrame,
+    diagnosis_long: pd.DataFrame | None,
+    inc_key_col: str = "INC_KEY",
+    code_col: str = "ICDDIAGNOSISCODE",
+) -> pd.DataFrame:
+    """Left-join the per-patient ICD-code-list string onto ``trauma`` as the
+    single ``ICD_DIAG_CODES`` column.  Patients with no codes get ""."""
+    out = trauma.copy()
+    tcols = {c.lower(): c for c in out.columns}
+    t_inc = tcols.get(inc_key_col.lower())
+    if t_inc is None or diagnosis_long is None or len(diagnosis_long) == 0:
+        out[ICD_CODE_LIST_COL] = ""
+        return out
+    codes = collect_icd_codes(diagnosis_long, inc_key_col=inc_key_col, code_col=code_col)
+    if codes.empty:
+        out[ICD_CODE_LIST_COL] = ""
+        return out
+    if t_inc != inc_key_col:
+        codes = codes.rename(columns={inc_key_col: t_inc})
+    out = out.merge(codes, on=t_inc, how="left")
+    out[ICD_CODE_LIST_COL] = out[ICD_CODE_LIST_COL].fillna("")
+    return out
+
+
 def merge_barell_features(
     trauma: pd.DataFrame,
-    aisdiag: pd.DataFrame | None,
+    diagnosis_long: pd.DataFrame | None,  # ICD-10-CM table (PUF_ICDDIAGNOSIS), not AIS
     inc_key_col: str = "INC_KEY",
     code_col: str = "ICDDIAGNOSISCODE",
 ) -> pd.DataFrame:
@@ -434,9 +528,9 @@ def merge_barell_features(
     """
     out = trauma.copy()
 
-    if aisdiag is None or len(aisdiag) == 0:
+    if diagnosis_long is None or len(diagnosis_long) == 0:
         log.warning(
-            "merge_barell_features: PUF_AISDIAGNOSIS is missing — "
+            "merge_barell_features: ICD-10-CM diagnosis table is missing — "
             "filling all %d Barell features with 0 for every patient.",
             len(ALL_BARELL_FEATURES),
         )
@@ -445,7 +539,7 @@ def merge_barell_features(
         return out
 
     barell_wide = compute_barell_features(
-        aisdiag, inc_key_col=inc_key_col, code_col=code_col,
+        diagnosis_long, inc_key_col=inc_key_col, code_col=code_col,
     )
     if len(barell_wide) == 0:
         for col in ALL_BARELL_FEATURES:

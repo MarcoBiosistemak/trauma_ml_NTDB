@@ -41,6 +41,11 @@ TARGET_SUBFOLDER = {
     "ISS_band":               "iss_band",
     "niss_band":              "niss_band",
     "NISS_band":              "niss_band",
+    # Round 52: binary (ISS>=16 / NISS>=16) band targets.
+    "iss_band_binary":        "iss_band_binary",
+    "ISS_band_binary":        "iss_band_binary",
+    "niss_band_binary":       "niss_band_binary",
+    "NISS_band_binary":       "niss_band_binary",
     # Add more here as new targets are introduced.  Default behaviour
     # (when target-name not in this dict) is to use the target name as
     # the subfolder verbatim.
@@ -52,15 +57,37 @@ def _outputs_subfolder_for(target_name: str) -> str:
     return TARGET_SUBFOLDER.get(target_name, target_name)
 
 
+# Round 52: built-in target definitions that are ALWAYS available, even if the
+# user's config/experiment_grids.yaml does not list them.  They are merged in
+# only when absent from the YAML (the YAML always wins on name collisions), so
+# `--targets ISS_band_binary` / `NISS_band_binary` resolve out of the box and
+# no manual YAML edit is required.  Add new always-on targets here.
+_BUILTIN_TARGET_DEFS: list[dict] = [
+    {"name": "ISS_band_binary",  "kind": "binary_threshold",
+     "spec": {"variable": "ISS",  "threshold": 15}},   # y = 1 when ISS  > 15 (ISS  >= 16)
+    {"name": "NISS_band_binary", "kind": "binary_threshold",
+     "spec": {"variable": "NISS", "threshold": 15}},   # y = 1 when NISS > 15 (NISS >= 16)
+]
+
+
 def _parse_target_defs(target_cfg: list[dict]) -> dict[str, TargetSpec]:
-    return {t["name"]: TargetSpec(name=t["name"], kind=t["kind"], spec=t["spec"])
-            for t in target_cfg}
+    specs = {t["name"]: TargetSpec(name=t["name"], kind=t["kind"], spec=t["spec"])
+             for t in target_cfg}
+    # Merge built-ins for any name the YAML did not define (YAML wins).
+    for d in _BUILTIN_TARGET_DEFS:
+        if d["name"] not in specs:
+            specs[d["name"]] = TargetSpec(name=d["name"], kind=d["kind"], spec=d["spec"])
+            log.info("Target %r not defined in YAML — using built-in default "
+                     "(kind=%s, spec=%s).", d["name"], d["kind"], d["spec"])
+    return specs
 
 
 def _build_grid(
     targets, predictor_types, phase_cutoffs, inclusion_strategies,
     imputers, model_families, calibrations, missingness_thresholds, augmentations,
     imputer_checks=(False,),
+    aug_targets=("in_hospital_mortality",),
+    calib_targets=("in_hospital_mortality",),
 ):
     """Enumerate the experiment grid.
 
@@ -68,6 +95,15 @@ def _build_grid(
     that adding ``True`` to it appends new combos at the END of the model_id
     sequence, leaving every previously-assigned model_id unchanged.  This
     is what lets you keep already-run results and only train the new combos.
+
+    Round 52/53: augmentation and calibration are gated by SEPARATE target
+    sets, because they have different applicability:
+      - ``calib_targets`` — probability calibration (Platt/isotonic) only
+        makes sense for BINARY targets (mortality + binary_threshold bands).
+      - ``aug_targets`` — SMOTE/ADASYN oversampling works for BINARY AND
+        MULTICLASS, so this set also includes the 4-class ordinal_bands
+        targets (ISS_band / NISS_band).  Augmentation is still skipped at
+        train time when imputer='none' (NaN input) — see _augment_if_needed.
 
     Two skip rules keep the grid sane:
       - ``imputer_method == "none"`` is only valid for NaN-tolerant
@@ -78,13 +114,10 @@ def _build_grid(
         ``imputer_check == False`` variant (point 5).  This prevents
         duplicate identical runs.
     """
-    NAN_TOLERANT = {"xgboost", "lightgbm", "catboost", "flaml"}
+    NAN_TOLERANT = {"xgboost", "lightgbm", "catboost", "flaml", "doshi_ffnn_icd"}
+    aug_targets = set(aug_targets)
+    calib_targets = set(calib_targets)
     grid = []
-    # imputer_checks is the OUTERMOST loop: all imputer_check=False combos
-    # are enumerated first (in exactly the order they had before this axis
-    # existed), then all imputer_check=True combos are appended.  This is
-    # what guarantees existing model_ids are byte-for-byte unchanged when
-    # you add --imputer-check to a slurm you've already partly run.
     for imp_check in imputer_checks:
         combos = itertools.product(
             targets, predictor_types, phase_cutoffs, inclusion_strategies,
@@ -93,9 +126,9 @@ def _build_grid(
         )
         for (target, ptype, phase, incl, imp, family, calib, missing,
              aug) in combos:
-            if aug is not None and target != "in_hospital_mortality":
+            if aug is not None and target not in aug_targets:
                 continue
-            if calib != "none" and target != "in_hospital_mortality":
+            if calib != "none" and target not in calib_targets:
                 continue
             # imputer=none only for NaN-tolerant families
             if imp == "none" and family not in NAN_TOLERANT:
@@ -190,6 +223,21 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--n-jobs", type=int, default=4)
     parser.add_argument(
+        "--bootstrap-ci", type=int, default=0, metavar="N",
+        help="If >0, attach stratified percentile bootstrap CIs (N resamples) "
+             "to the test + holdout (+ cohort) metric JSONs as "
+             "<metric>__ci_low/__ci_high. Off by default. 200-1000 is typical; "
+             "on the full NTDB holdout this adds noticeable time.")
+    parser.add_argument(
+        "--ci-alpha", type=float, default=0.05,
+        help="Significance level for bootstrap CIs (default 0.05 -> 95%% CI).")
+    parser.add_argument(
+        "--plot-ci-bootstrap", type=int, default=200, metavar="N",
+        help="Resamples for the AUROC/AUPRC confidence intervals shown in the "
+             "binary ROC/PR plot legends (default 200, ON by default; 0 to "
+             "disable). Cheap AUC/AP-only bootstrap, separate from the heavier "
+             "all-metric --bootstrap-ci. ROC/PR render only for binary targets.")
+    parser.add_argument(
         "--use-gpu", default="auto", choices=["auto", "force", "never"],
         help=(
             "GPU policy for model factories that support it (xgboost, "
@@ -243,6 +291,17 @@ def main(argv: list[str] | None = None) -> None:
             "already wrote `<outputs_root>/metrics/<model_id>/overall__test.json` "
             "are SKIPPED, so resubmitting after a walltime hit picks up where it "
             "left off.  Pass --no-resume to retrain every combo from scratch."
+        ),
+    )
+    parser.add_argument(
+        "--no-prep-cache", action="store_true",
+        help=(
+            "Disable the round-61 preprocessing/model cache.  By default the "
+            "runner fits the encoders+imputer ONCE per (target, phase, "
+            "imputer, missingness, family) group and reuses them across every "
+            "calibration/augmentation variant, and reuses the trained base "
+            "model across calibration variants (binary).  Saved artifacts are "
+            "identical either way; this flag forces a fresh fit per combo."
         ),
     )
     parser.add_argument(
@@ -311,10 +370,26 @@ def main(argv: list[str] | None = None) -> None:
     # --imputer-check is passed.  True combos enumerate LAST.
     imputer_checks = (False, True) if args.imputer_check else (False,)
 
+    # Round 52: targets eligible for augmentation + calibration = BINARY ones
+    # (mortality + any binary_threshold band targets such as ISS>=16/NISS>=16).
+    # Multiclass ordinal_bands targets are excluded (calib/aug don't apply).
+    # Round 53: calibration only for BINARY targets; augmentation for binary
+    # AND multiclass (ordinal_bands) targets — SMOTE/ADASYN handle multiclass.
+    calib_targets = {
+        name for name, spec in target_specs.items()
+        if spec.kind in ("binary", "binary_threshold")
+    }
+    aug_targets = {
+        name for name, spec in target_specs.items()
+        if spec.kind in ("binary", "binary_threshold", "ordinal_bands")
+    }
+
     grid = _build_grid(
         targets, predictor_types, phase_cutoffs, inclusion_strategies,
         imputers, model_families, calibrations, missingness_thresholds, augmentations,
         imputer_checks=imputer_checks,
+        aug_targets=aug_targets,
+        calib_targets=calib_targets,
     )
     log.info("Full grid has %d combinations", len(grid))
 
@@ -378,28 +453,14 @@ def main(argv: list[str] | None = None) -> None:
     n_skipped = 0
     n_attempted = 0
 
-    for idx, combo in grid:
-        model_id = f"{args.model_id_prefix}_{idx:04d}"
-        target_name = combo["target"]
-        target_subfolder = _outputs_subfolder_for(target_name)
-        # outputs_root resolution:
-        #   * --outputs-root SET: respect it; append target subfolder
-        #   * --outputs-root UNSET: outputs/<target_subfolder>/
-        if outputs_root_explicit is not None:
-            outputs_root = outputs_root_explicit / target_subfolder
-        else:
-            outputs_root = outputs_root_default / target_subfolder
-        targets_trained.add(target_name)
+    def _resolve_outputs_root(target_name):
+        sub = _outputs_subfolder_for(target_name)
+        base = (outputs_root_explicit if outputs_root_explicit is not None
+                else outputs_root_default)
+        return base / sub
 
-        # Resume check: skip if `metrics/<model_id>/overall__test.json` exists
-        sentinel = outputs_root / "metrics" / model_id / "overall__test.json"
-        if sentinel.exists() and sentinel.stat().st_size > 0 and not args.no_resume:
-            n_skipped += 1
-            log.info("[%s] SKIP (already completed: %s)", model_id, sentinel)
-            continue
-        n_attempted += 1
-
-        cfg = TrainerConfig(
+    def _build_cfg(model_id, combo):
+        return TrainerConfig(
             model_id=model_id,
             dataset_path=dataset_path,
             catalogue=catalogue,
@@ -418,35 +479,101 @@ def main(argv: list[str] | None = None) -> None:
             sample_fraction=args.sample_fraction,
             n_jobs=args.n_jobs,
             use_gpu=args.use_gpu,
+            n_bootstrap=args.bootstrap_ci,
+            ci_alpha=args.ci_alpha,
+            plot_ci_bootstrap=args.plot_ci_bootstrap,
             generate_plots=not args.no_plots,
             enable_shap=not args.no_shap,
             tune_hparams=args.tune_hparams,
             n_search_iter=args.n_search_iter,
             cv_folds=args.cv_folds,
         )
-        log.info("=" * 72)
-        log.info("[%s] %s", model_id, combo)
-        log.info("    -> outputs_root: %s", outputs_root)
-        log.info("=" * 72)
+
+    def _cleanup():
+        # Round 16: aggressive cleanup between models.  Long grids were
+        # segfaulting AFTER successful completion — matplotlib figure registry
+        # + accumulated SHAP native arrays + sklearn fitted-attribute closures
+        # pin memory.  Force-release so the next iteration starts fresh.
         try:
-            Trainer(cfg).run(outputs_root)
-        except Exception as exc:
-            log.error("[%s] FAILED: %s", model_id, exc)
-            log.debug(traceback.format_exc())
-            continue
-        finally:
-            # Round 16: aggressive cleanup between models.  Long grids
-            # (500+ random_forest fits) were segfaulting AFTER successful
-            # completion of one model — matplotlib figure registry +
-            # accumulated SHAP native arrays + sklearn fitted-attribute
-            # closures pin memory until the parent process dies.
-            # Force-release here so the next iteration starts fresh.
+            import matplotlib.pyplot as _plt
+            _plt.close("all")
+        except Exception:
+            pass
+        gc.collect()
+
+    # ---- Round 61: preprocessing/model cache --------------------------- #
+    # Group combos whose preprocessing is identical (everything EXCEPT
+    # calibration + augmentation).  Within a group we fit encoders+imputer
+    # once and reuse the trained base model across calibration variants.
+    def _prep_key(combo):
+        return (combo["target"], combo["predictor_type"], combo["phase_cutoff"],
+                combo["inclusion_strategy"], combo["missingness_threshold"],
+                combo["imputer_method"], combo.get("imputer_check", False),
+                combo["model_family"])
+
+    def _calib_order(item):
+        _, c = item
+        return (str(c["data_augmentation"]),
+                0 if (c["calibration"] or "none") == "none" else 1,
+                str(c["calibration"]))
+
+    from collections import OrderedDict
+    groups: "OrderedDict[tuple, list]" = OrderedDict()
+    for idx, combo in grid:
+        groups.setdefault(_prep_key(combo), []).append((idx, combo))
+
+    for _pk, members in groups.items():
+        members = sorted(members, key=_calib_order)
+        trainer = None            # prepared Trainer, reused across the group
+        prep_ok = True
+        base_models: dict = {}    # data_augmentation -> uncalibrated base (binary)
+        for idx, combo in members:
+            model_id = f"{args.model_id_prefix}_{idx:04d}"
+            outputs_root = _resolve_outputs_root(combo["target"])
+            targets_trained.add(combo["target"])
+
+            sentinel = outputs_root / "metrics" / model_id / "overall__test.json"
+            if (not args.no_resume and sentinel.exists()
+                    and sentinel.stat().st_size > 0):
+                n_skipped += 1
+                log.info("[%s] SKIP (already completed: %s)", model_id, sentinel)
+                continue
+            n_attempted += 1
+            cfg = _build_cfg(model_id, combo)
+            log.info("=" * 72)
+            log.info("[%s] %s", model_id, combo)
+            log.info("    -> outputs_root: %s", outputs_root)
+            log.info("=" * 72)
             try:
-                import matplotlib.pyplot as _plt
-                _plt.close("all")    # release every figure across every backend
-            except Exception:
-                pass
-            gc.collect()
+                if args.no_prep_cache:
+                    Trainer(cfg).run(outputs_root)
+                    continue
+
+                if trainer is None:
+                    _t = Trainer(cfg)
+                    prep_ok = _t.prepare(outputs_root)   # may raise -> trainer stays None
+                    trainer = _t
+                else:
+                    trainer.reset_for_next_combo(cfg)
+
+                if not prep_ok:
+                    # imputer_check dropped every predictor: the preprocessing is
+                    # identical for the whole group, so each combo is an empty run.
+                    trainer._emit_empty_run(outputs_root)
+                    continue
+
+                aug = combo["data_augmentation"]
+                is_binary = (trainer.task == "binary")
+                base = base_models.get(aug) if is_binary else None
+                trainer.fit_evaluate_save(outputs_root, cached_base_model=base)
+                if is_binary and base is None and trainer.model is not None:
+                    base_models[aug] = trainer.model     # reuse for platt/isotonic
+            except Exception as exc:
+                log.error("[%s] FAILED: %s", model_id, exc)
+                log.debug(traceback.format_exc())
+                continue
+            finally:
+                _cleanup()
 
     print(f"[OK] Grid complete. Trained {len(targets_trained)} target(s): "
           f"{sorted(targets_trained)}")

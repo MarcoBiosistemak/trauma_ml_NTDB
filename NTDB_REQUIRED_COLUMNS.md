@@ -1,108 +1,80 @@
-# NTDB columns required by trauma_ml
+# NTDB Required & Used Columns
 
-This document lists every NTDB column the pipeline expects to find and what each is used for. Use it to verify your raw NTDB CSVs and check the build output before training.
+This is the authoritative list of NTDB (TQP PUF) columns the pipeline consumes,
+how they map to model features, and at which **phase** each becomes available.
+It assumes the full pipeline is run for **every target** (mortality, ISS/NISS
+band 4-class, ISS/NISS band binary).
 
-The pipeline tolerates **case-insensitive** matches and **alias matches** for the canonical names — e.g. `AGEyears` (NTDB AY 2019 actual name) → `AGEYEARS`, `TOTALGCS` → `GCSTOTAL`. See `harmonise_year` in `ntdb_loader.py` for the full alias map.
+All variable names are the pipeline's canonical (post-alias) names. The loader
+harmonises common NTDB aliases automatically: `AgeYears→AGEYEARS`,
+`TOTALGCS→GCSTOTAL`, `SBP→SBPFIRST`, `RESPIRATORYRATE→RRFIRST`.
 
-## Columns the user must verify exist in raw NTDB CSVs
+## Required source tables (`config/paths.yaml → ntdb_tables`)
 
-These are checked in `PUF_TRAUMA*.csv` for each admission year. Names below are the **canonical** names; aliases that get auto-renamed are listed in parentheses.
+| Key | File (per AY) | Used for |
+|---|---|---|
+| `puf` (main) | `PUF_TRAUMA.csv` | demographics, vitals, anthropometry, payer, disposition |
+| `aisdiagnosis` | `PUF_AISDIAGNOSIS.csv` | NISS derivation, AIS severities (band targets) |
+| `icddiagnosis` | `PUF_ICDDIAGNOSIS.csv` | Barell matrix + specific-injury (INJ_*) features |
+| `ecode` | `PUF_ECODE.csv` | TRAUMATYPE / MECHANISM / INTENT |
+| `preexistingconditions` | `PUF_PREEXISTINGCONDITIONS.csv` | 18 comorbidity flags |
 
-### Demographics (mandatory — needed for cohort definitions, stratification, TRISS)
+## Native columns by phase
 
-| Canonical | Aliases auto-resolved | Used for |
-|-----------|----------------------|----------|
-| `AGEYEARS` | `AGEyears`, `AGE_YEARS`, `AGE_YRS`, `AGE_IN_YEARS`, `AGEINYEARS`, `AGE`, `PATIENTAGE`, `PT_AGE_YR` | TRISS age cutoff (≥55), stratification, all cohorts |
-| `SEX` | (none) | Subgroup analysis |
+### L1 — On-scene / first contact (32 features)
+- **Demographics / admin:** `AGEYEARS`, `SEX`, `ETHNICITY`, `PRIMARYMETHODPAYMENT`
+  (insurance/payer — also a sociodemographic **subgroup axis**)
+- **Anthropometry:** `HEIGHT`, `WEIGHT`
+- **Mechanism (from ECODE):** `TRAUMATYPE`, `MECHANISM`, `INTENT`
+- **On-scene physiology:** `GCSTOTAL`, `SBPFIRST`, `RRFIRST`
+- **On-scene status:** `PREHOSPITALCARDIACARREST`, `TRANSPORTMODE`
+- **18 comorbidities:** `SMOKINGSTATUS`, `COPD`, `CHF`, `MI`, `HYPERTENSION`,
+  `PERIPHERALVASCULARDISEASE`, `ESRD`, `CIRRHOSIS`, `DIABETESMELLITUS`,
+  `BLEEDINGDISORDER`, `DISSEMINATEDCANCER`, `ALCOHOLUSEDISORDER`,
+  `MENTALPERSONALITYDISORDER`, `SUBSTANCEABUSEDISORDERDRUG`,
+  `ATTENTIONDEFICITDISORDER`, `DEMENTIA`, `ADVANCEDDIRECTIVELIMITINGCARE`,
+  `FUNCTIONALLYDEPENDENTHEALTHSTATUS`
 
-### On-scene physiology (mandatory — needed for `onsite_complete` cohort and TRISS)
+### L2 — + At ED arrival (+7 → 39 features)
+`TEMPERATURE`, `PULSEOXIMETRY`, `PULSERATE`, `HOSPITALARRIVALHRS`,
+`TBIPUPILLARYRESPONSE`, `ALCOHOLSCREEN`, `ALCOHOLSCREENRESULT`
 
-| Canonical | Aliases auto-resolved | Used for |
-|-----------|----------------------|----------|
-| `GCSTOTAL` | `TOTALGCS`, `GCS_TOTAL`, `GCS` | TRISS RTS component, baseline cohort |
-| `SBPFIRST` | `SBP`, `FIRSTSBP`, `SBP_FIRST`, `INITIALSBP` | TRISS RTS component, baseline cohort |
-| `RRFIRST` | `RESPIRATORYRATE`, `RR`, `FIRSTRR`, `RR_FIRST`, `INITIALRR`, `RESP_RATE` | TRISS RTS component, baseline cohort |
+### L3 — + In-hospital (a posteriori)
+- **Mortality target (+24 → 63):** `ISS`, `NISS`, + the 22 injury features below.
+- **ISS/NISS band targets (+22 → 61):** the 22 injury features only. `ISS`/`NISS`
+  are **excluded** because they (or AIS severities) define the band label.
 
-### ED-arrival physiology (optional — extends `ed_complete` cohort if present)
+**22 injury features (derived, L3 only):**
+`BARELL_TBI`, `BARELL_OTHER_HEAD`, `BARELL_FACE`, `BARELL_NECK`, `BARELL_SCI`,
+`BARELL_VERTEBRAL_NO_SCI`, `BARELL_THORAX`, `BARELL_ABDOMEN_PELVIS`,
+`BARELL_UPPER_EXTREMITY`, `BARELL_LOWER_EXTREMITY`, `BARELL_BURNS`,
+`BARELL_SYSTEM_OR_OTHER`, `INJ_SUBDURAL_HEMORRHAGE`, `INJ_CONCUSSION`,
+`INJ_PNEUMOTHORAX`, `INJ_RIB_FRACTURE_MULTIPLE`, `INJ_SPLENIC_LACERATION`,
+`INJ_LIVER_LACERATION`, `INJ_PELVIC_FRACTURE`, `INJ_FEMUR_FRACTURE`,
+`INJ_DISTAL_RADIUS_FRACTURE`, `INJ_FOOT_FRACTURE`
 
-| Canonical | Used for |
-|-----------|----------|
-| `TEMPERATURE` | `ed_complete` cohort definition |
-| `PULSEOXIMETRY` | `ed_complete` cohort definition |
-| `PULSERATE` | `ed_complete` cohort definition |
+## Derived (not native) — produced during build
+- `NISS` from `PUF_AISDIAGNOSIS`; `ISS` native or derived.
+- `BARELL_*` / `INJ_*` from `PUF_ICDDIAGNOSIS` (Barell matrix + ICD patterns).
+- `TRAUMATYPE`, `MECHANISM`, `INTENT` from `PUF_ECODE`.
+- 18 comorbidity flags from `PUF_PREEXISTINGCONDITIONS`.
 
-### Anatomy scores (mandatory — needed for ISS/NISS baselines)
+## Explicitly EXCLUDED / blacklisted
+- `EDDISCHARGEHRS` — **leakage** (an ED death's "ED discharge" is the death
+  event; ED length-of-stay is fixed by the disposition). Blacklisted.
+- `INC_KEY` and registry IDs — identifiers.
+- `HOSPDISCHARGEDISPOSITION`, `EDDISCHARGEDISPOSITION`, `DEATHINED` — outcome
+  columns (used to BUILD the mortality target, never as predictors).
+- Non-native placeholders that do **not** exist in the PUF: `RACE` (only
+  `RACE_*` flags ship), `PRIMARYINSURANCE` (real name is `PRIMARYMETHODPAYMENT`),
+  `EDSBP` / `SBPHIGHEST` / `*LOWEST`.
 
-| Canonical | Source | Used for |
-|-----------|--------|----------|
-| `ISS` | `PUF_TRAUMA.csv` (also `ISS_05` → `ISS` in AY 2019) | ISS baseline (≥16 → death) |
-| `NISS` | **DERIVED from `PUF_AISDIAGNOSIS.csv`** | NISS baseline (≥16 → death) |
+## `PRIMARYMETHODPAYMENT` category codes (all AYs)
+`1=Medicaid`, `2=Not Billed`, `3=Self-Pay`, `4=Private/Commercial Insurance`,
+`6=Medicare`, `7=Other Government`, `10=Other`.
 
-⚠ `NISS` is **not** an NTDB raw column — it is computed by the pipeline as the sum of squares of the three highest `AISSEVERITY` values per patient. This requires `PUF_AISDIAGNOSIS.csv` to be present at the path expected by `ntdb_tables["aisdiagnosis"]` in your build config. **If this file is missing, `NISS` will be 100% NaN in the output parquet.**
-
-### Mechanism (mandatory — needed for TRISS blunt/penetrating split)
-
-| Canonical | Source | Used for |
-|-----------|--------|----------|
-| `TRAUMATYPE` | **JOINED from `PUF_ECODE_LOOKUP.csv`** via `PRIMARYECODEICD10` | TRISS coefficient selection |
-| `MECHANISM` | Same join | (Future use) |
-| `INTENT` | Same join | (Future use) |
-| `PRIMARYECODEICD10` | `PUF_TRAUMA.csv` | Join key for the above |
-
-⚠ `TRAUMATYPE`, `MECHANISM`, `INTENT` are **not** raw NTDB PUF_TRAUMA columns — they come from joining `PUF_ECODE_LOOKUP.csv`. **If this file is missing, all three will be 100% NaN and TRISS will fall back to "blunt" coefficients for every patient** (a warning is logged).
-
-The lookup CSV must have a join key in one of these names (case-insensitive — the loader handles `ECode`, `ecode`, `ICD10ECode`, etc.):
-1. `ICD10ECODE` (some NTDB releases)
-2. `ICDECODE`
-3. `ECODE` ← **actual NTDB AY 2021/2022 uses `ECode`** (mixed case, resolved automatically)
-4. `PRIMARYECODEICD10`
-
-### Outcome variables (mandatory — needed for target construction)
-
-| Canonical | Used for |
-|-----------|----------|
-| `HOSPDISCHARGEDISPOSITION` | Mortality outcome (value 5 = deceased) |
-| `EDDISCHARGEDISPOSITION` | Mortality outcome (value 5 = deceased in ED) |
-| `DEATHINED` | AY 2019 only — mapped to `EDDISCHARGEDISPOSITION=5` |
-
-### Identity / partitioning
-
-| Canonical | Used for |
-|-----------|----------|
-| `INC_KEY` (or `inc_key`) | Patient row identifier — joins `PUF_AISDIAGNOSIS` to `PUF_TRAUMA` |
-| `__admission_year` | Added by `harmonise_year` — used for temporal holdout |
-
-## How to verify your build output
-
-After running `trauma-build`, the parquet should contain **all** of the canonical names above with **non-zero non-NaN counts**. Run this Python snippet against the output:
-
-```python
-import pyarrow.parquet as pq
-pf = pq.ParquetFile("path/to/unified_train.parquet")
-df = pf.read(columns=[
-    "AGEYEARS", "SEX",
-    "GCSTOTAL", "SBPFIRST", "RRFIRST",
-    "ISS", "NISS",
-    "TRAUMATYPE", "MECHANISM", "INTENT",
-    "HOSPDISCHARGEDISPOSITION", "EDDISCHARGEDISPOSITION",
-]).to_pandas()
-
-for col in df.columns:
-    pct_nan = 100 * df[col].isna().mean()
-    flag = "❌" if pct_nan > 99 else ("⚠" if pct_nan > 30 else "✓")
-    print(f"  {flag} {col}: {pct_nan:.1f}% NaN")
-```
-
-If you see ❌ for `NISS`, your `PUF_AISDIAGNOSIS.csv` is missing or the path is wrong.
-If you see ❌ for `TRAUMATYPE`, your `PUF_ECODE_LOOKUP.csv` is missing or the path is wrong.
-If you see ❌ or column-not-present for `AGEYEARS`, check whether your CSV uses `AGEyears` (mixed case — fixed in current alias resolver) or some other variant.
-
-## Build log lines to watch for
-
-`trauma-build` should log the following INFO lines per year. If you see the WARNING variants instead, fix the corresponding CSV:
-
-| Good (INFO)                                                                          | Bad (WARNING)                                              |
-|--------------------------------------------------------------------------------------|------------------------------------------------------------|
-| `ECODE join complete: <N> / <M> rows matched (<P>%) — TRAUMATYPE/MECHANISM/INTENT populated` | `No PUF_ECODE_LOOKUP provided — TRAUMATYPE/MECHANISM/INTENT will be NaN` |
-| `AY <year>: aliased AGEyears -> AGEYEARS (case-insensitive match for canonical name)` | `AY <year>: AGEYEARS not present in CSV after alias resolution` |
-| (NISS derivation produces no INFO log on success — verify by checking parquet)       | NISS will be silently 100% NaN if `PUF_AISDIAGNOSIS.csv` not found |
+## Availability notes
+- EMS prehospital interval fields exist only for AY 2019–2020 (now included in the build).
+- NTDB has **no drug-screen** field — only alcohol (`ALCOHOLSCREEN*`).
+- `HOSPITALARRIVALHRS`, `ALCOHOLSCREENRESULT`, `TBIPUPILLARYRESPONSE` are often
+  >50% missing and may be dropped by the missingness threshold.
